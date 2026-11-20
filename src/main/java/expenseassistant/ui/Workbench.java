@@ -1301,6 +1301,8 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
         if (item.reviewReasons().contains("RECEIPT_CONFLICT")) return "收据金额冲突";
         if (item.reviewReasons().contains("CNY_CONFIRMATION_REQUIRED")
                 || item.reviewReasons().contains("AMOUNT_NEEDS_REVIEW")) return "人民币金额待确认";
+        if (item.reviewReasons().contains("HOTEL_NIGHTS_NEEDS_REVIEW")
+                && !item.reviewReasons().contains("SOURCE_REVIEW_REQUIRED")) return "住宿天数待核对";
         if (item.reviewReasons().isEmpty()) return "已核对";
         return ExpenseAmounts.project(view.info().type(), item).isEmpty() ? "待核对" : "部分确认";
     }

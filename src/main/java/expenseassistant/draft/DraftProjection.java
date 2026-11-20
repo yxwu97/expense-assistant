@@ -46,6 +46,7 @@ final class DraftProjection {
     static final String SOURCE_VERSION = "SOURCE_VERSION";
     static final String MILEAGE_OUT_OF_RANGE = "MILEAGE_OUT_OF_RANGE";
     static final String MILEAGE_NEEDS_REVIEW = "MILEAGE_NEEDS_REVIEW";
+    static final String HOTEL_NIGHTS_NEEDS_REVIEW = "HOTEL_NIGHTS_NEEDS_REVIEW";
     static final Comparator<Item> ITEM_ORDER = Comparator
             .comparing(Item::startDate, Comparator.nullsLast(Comparator.naturalOrder())).thenComparingLong(Item::stableOrder);
 
@@ -275,6 +276,7 @@ final class DraftProjection {
         if (info.type() == CaseType.PRIVATE_CAR) {
             projectMileage(info, items, overrides, known, links);
         }
+        projectHotelNights(info.type(), items, overrides);
         for (var item : items.values()) {
             if (item.start == null) {
                 item.reasons.add("BUSINESS_DATE_MISSING");
@@ -292,6 +294,19 @@ final class DraftProjection {
                 .toList();
         List<Claim> sortedClaims = claims.values().stream().sorted(Comparator.comparing(Claim::chargeKey)).toList();
         return new Projection(immutable, sortedLinks, sortedClaims, proposal.duplicates());
+    }
+
+    private static void projectHotelNights(CaseType type, Map<String, MutableItem> items, List<OverrideView> overrides) {
+        var manual = new HashSet<String>();
+        overrides.stream().filter(value -> "nights".equals(value.fieldKey()))
+                .map(OverrideView::targetId).forEach(manual::add);
+        for (var item : items.values()) {
+            item.reasons.remove(HOTEL_NIGHTS_NEEDS_REVIEW);
+            if (type == CaseType.TRAVEL && ("HOTEL".equals(item.subtype) || item.amounts.containsKey(Component.HOTEL))
+                    && !item.fields.containsKey("nights") && !manual.contains(item.id)) {
+                item.reasons.add(HOTEL_NIGHTS_NEEDS_REVIEW);
+            }
+        }
     }
 
     private static ReceiptProjection retainReceiptIdentities(CaseView before, List<Evidence> eligible,
@@ -433,7 +448,7 @@ final class DraftProjection {
         var selected = new HashSet<String>();
         for (var link : links) {
             var evidence = known.get(link.unitId());
-            if (evidence != null && Set.of("3", "4").contains(evidence.page().parserVersion())
+            if (evidence != null && Set.of("3", "4", "5").contains(evidence.page().parserVersion())
                     && evidence.page().value("selectedRouteDistanceKm") != null
                     && link.itemId().equals(ExpenseMatcher.stableId(info.id(), "mileage:" + evidence.unitId()))) {
                 selected.add(link.itemId());

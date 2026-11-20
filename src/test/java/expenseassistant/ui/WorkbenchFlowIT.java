@@ -171,6 +171,43 @@ class WorkbenchFlowIT {
         }
     }
 
+    @Test
+    void hotelNightStatusFollowsConfirmedBlankAndRestoredValues() throws Exception {
+        Path batch = temporary.resolve("受控批次");
+        SampleCorpus.verifyAndCopy(SampleCorpus.defaultSource(), batch);
+        var service = services();
+        var folder = batch.resolve("深圳出差-2026.11.12~13");
+        var info = service.cases.openCase(batch, folder);
+        CaseView review;
+        try (var ticket = service.scan.begin(info.id(), info.revision())) {
+            review = service.drafts.mergeScan(service.scan.scan(ticket));
+        }
+        var hotel = review.items().stream().filter(row -> "HOTEL".equals(row.subtype())).findFirst().orElseThrow();
+        int row = review.items().indexOf(hotel);
+        try (var fixture = show(service)) {
+            var workbench = fixture.workbench;
+            FxTestSession.runOnFxThread(() -> {
+                workbench.render(review);
+                assertEquals("住宿天数待核对", rowStatus(workbench, row));
+            });
+            saveHotelNights(workbench, new DraftService.SetField(hotel.id(), "nights", "1"));
+            assertEquals("1", service.drafts.load(info.id()).items().get(row).fields().get("nights"));
+            FxTestSession.runOnFxThread(() -> assertNotEquals("住宿天数待核对", rowStatus(workbench, row)));
+
+            saveHotelNights(workbench, new DraftService.SetField(hotel.id(), "nights", null));
+            assertNull(service.drafts.load(info.id()).items().get(row).fields().get("nights"));
+            FxTestSession.runOnFxThread(() -> assertNotEquals("住宿天数待核对", rowStatus(workbench, row)));
+
+            saveHotelNights(workbench, new DraftService.RestoreField(hotel.id(), "nights"));
+            FxTestSession.runOnFxThread(() -> assertEquals("住宿天数待核对", rowStatus(workbench, row)));
+        }
+    }
+
+    private static void saveHotelNights(Workbench workbench, DraftService.Change change) throws Exception {
+        FxTestSession.runOnFxThread(() -> workbench.save(new EvidenceEditor.Edit(List.of(change), "核对住宿天数")));
+        await(() -> !workbench.busy() && "已保存修改".equals(label(workbench, "expense-progress-text").getText()));
+    }
+
     private static void controlledMileageEvidence(Database database, CaseView view) {
         database.transaction(connection -> {
             try (var page = connection.prepareStatement("UPDATE document_page SET kind='MILEAGE', warnings=? WHERE doc_id=?");

@@ -37,6 +37,7 @@ import java.util.Map;
 
 public final class ExcelWriter {
     private static final String DATE_FORMAT = "yyyy-mm-dd";
+    private static final String TRAVEL_DATE_FORMAT = "m\"月\"d\"日\"";
     private static final String AMOUNT_FORMAT = "0.00";
     private static final int PRIVATE_CAR_DATE_WIDTH = 14 * 256;
     private static final FontRenderContext FONT_CONTEXT = new FontRenderContext(null, true, true);
@@ -131,6 +132,9 @@ public final class ExcelWriter {
                     }
                     Object expected = values.get(col);
                     require(matches(cell, expected), "单元格与草稿不符 " + column(col) + row);
+                    if (snapshot.type() == CaseType.TRAVEL && col == 0 && expected instanceof LocalDate) {
+                        require(TRAVEL_DATE_FORMAT.equals(cell.getCellStyle().getDataFormatString()), "差旅日期格式不符 A" + row);
+                    }
                     if (expected instanceof BigDecimal amount && (layout.moneyColumns().containsKey(col)
                             || col == layout.quantityTotalColumn())) {
                         totals.merge(col, amount, BigDecimal::add);
@@ -217,7 +221,7 @@ public final class ExcelWriter {
         var fields = row.fields();
         var values = new LinkedHashMap<Integer, Object>();
         if (row.startDate() != null) {
-            values.put(0, row.endDate() == null || row.endDate().equals(row.startDate())
+            values.put(0, type == CaseType.TRAVEL || row.endDate() == null || row.endDate().equals(row.startDate())
                     ? row.startDate() : row.startDate() + "\n" + row.endDate());
         }
         switch (type) {
@@ -308,7 +312,7 @@ public final class ExcelWriter {
                 height = Math.max(height, demanded);
                 cell.setCellValue(text);
             } else if (value instanceof LocalDate date) {
-                cell.setCellStyle(styles.forCell(cell, DATE_FORMAT, false));
+                cell.setCellStyle(styles.forCell(cell, type == CaseType.TRAVEL ? TRAVEL_DATE_FORMAT : DATE_FORMAT, false));
                 cell.setCellValue(date);
             } else {
                 if (money) {

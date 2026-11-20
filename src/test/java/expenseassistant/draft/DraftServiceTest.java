@@ -16,12 +16,14 @@ import expenseassistant.casework.CaseException;
 import expenseassistant.casework.CaseJobs;
 import expenseassistant.casework.CaseService;
 import expenseassistant.draft.DraftService.LinkEvidence;
+import expenseassistant.draft.DraftService.RestoreField;
 import expenseassistant.draft.DraftService.SetAmount;
 import expenseassistant.draft.DraftService.SetAttachment;
 import expenseassistant.draft.DraftService.SetCaption;
 import expenseassistant.draft.DraftService.SetField;
 import expenseassistant.intake.PathPolicy;
 import expenseassistant.intake.ScanService;
+import expenseassistant.intake.TypeInference.CaseType;
 import expenseassistant.matching.ExpenseAmounts.Component;
 import expenseassistant.matching.ExpenseMatcher.Item;
 import expenseassistant.matching.ExpenseMatcher.Role;
@@ -287,7 +289,7 @@ class DraftServiceTest {
         assertEquals(updated, services.drafts().loadForReview(id));
         var rescanned = services.scan(id, updated.info().revision());
         assertTrue(rescanned.sources().stream().flatMap(source -> source.pages().stream())
-                .allMatch(page -> "4".equals(page.parserVersion()) && "USD".equals(page.value("currency"))));
+                .allMatch(page -> PageParser.VERSION.equals(page.parserVersion()) && "USD".equals(page.value("currency"))));
         assertEquals(updated.confirmedTotal(), rescanned.confirmedTotal());
     }
 
@@ -472,14 +474,74 @@ class DraftServiceTest {
     }
 
     @Test
+    void hotelNightReviewsRespectExplicitValuesDuringRescanAndSupportRestoration() throws Exception {
+        var services = setup();
+        var info = services.cases().openCase(services.batch(), services.batch().resolve("杭州出差-2026.10.21"));
+        var view = services.scan(info.id(), info.revision());
+        var hotel = view.items().stream().filter(row -> "HOTEL".equals(row.subtype())).findFirst().orElseThrow();
+        String itemId = hotel.id();
+        assertHotelNights(hotel, "1", false);
+
+        discardCachedHotelNights(services, view);
+        view = edit(services, view);
+        assertHotelNights(item(view, itemId), null, true);
+        view = edit(services, view, new SetField(itemId, "nights", "2"));
+        assertHotelNights(item(view, itemId), "2", false);
+        view = edit(services, view, new RestoreField(itemId, "nights"));
+        assertHotelNights(item(view, itemId), null, true);
+
+        for (String manual : new String[] { "2", null }) {
+            discardCachedHotelNights(services, view);
+            view = edit(services, view, new SetField(itemId, "nights", manual));
+            assertHotelNights(item(view, itemId), manual, false);
+            view = services.scan(info.id(), view.info().revision());
+            var page = hotelPage(view);
+            assertEquals(PageParser.VERSION, page.parserVersion());
+            assertEquals("1", page.value("nights"));
+            assertHotelNights(item(view, itemId), manual, false);
+            view = edit(services, view, new RestoreField(itemId, "nights"));
+            assertHotelNights(item(view, itemId), "1", false);
+        }
+        discardCachedHotelNights(services, view);
+        view = edit(services, view, new DraftService.SetType(CaseType.OTHER));
+        assertTrue(view.items().stream().noneMatch(row ->
+                row.reviewReasons().contains(DraftProjection.HOTEL_NIGHTS_NEEDS_REVIEW)));
+    }
+
+    private static void assertHotelNights(Item item, String expected, boolean needsReview) {
+        assertEquals(expected, item.fields().get("nights"));
+        assertEquals(needsReview, item.reviewReasons().contains(DraftProjection.HOTEL_NIGHTS_NEEDS_REVIEW));
+        assertEquals(36465L, item.amounts().get(Component.HOTEL).confirmedMinor());
+    }
+
+    private static PageResult hotelPage(CaseView view) {
+        return view.sources().stream().flatMap(source -> source.pages().stream())
+                .filter(page -> "HOTEL".equals(page.value("subtype"))).findFirst().orElseThrow();
+    }
+
+    private static void discardCachedHotelNights(Services services, CaseView view) {
+        String caseId = view.info().id();
+        var hotel = view.sources().stream().filter(source -> source.pages().stream()
+                .anyMatch(page -> "HOTEL".equals(page.value("subtype")))).findFirst().orElseThrow();
+        services.database().transaction(connection -> {
+            var store = new DraftStore(connection, caseId);
+            store.update("DELETE FROM field_candidate WHERE doc_id=? AND key='nights'", hotel.docId());
+            store.update("UPDATE field_candidate SET parser_version='4' WHERE doc_id=?", hotel.docId());
+            store.update("UPDATE document_page SET warnings=json_set(warnings,'$.version','4') WHERE doc_id=?", hotel.docId());
+            return null;
+        });
+    }
+
+    @Test
     void mileageDirectionsAndOverridesRecalculateTheRoundedFuel() throws Exception {
         var services = setup();
         var view = scanMileage(services, "甲-乙-20261101.png", "甲-乙-单程-20261102.png", "甲-乙-往返-20261103.png");
         record Expected(String km, long minor) {}
         var expect = List.of(new Expected("12.35", 1112), new Expected("12.35", 1112), new Expected("24.70", 2223));
+        var versions = List.of("3", "4", PageParser.VERSION);
         for (int index = 0; index < expect.size(); index++) {
             String path = view.sources().get(index).relativePath();
-            replaceMileagePage(services, view, path, "selectedRouteDistanceKm", "12.35", index == 0 ? "3" : PageParser.VERSION);
+            replaceMileagePage(services, view, path, "selectedRouteDistanceKm", "12.35", versions.get(index));
         }
         view = edit(services, view);
         for (int index = 0; index < expect.size(); index++) {

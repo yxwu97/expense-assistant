@@ -23,6 +23,7 @@ import expenseassistant.store.Database;
 import expenseassistant.store.InstanceLock;
 import expenseassistant.support.ReceiptFixtures;
 import expenseassistant.support.SampleCorpus;
+import org.apache.poi.ss.format.CellFormat;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
@@ -39,8 +40,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.time.LocalDate;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.function.Consumer;
 
 import static expenseassistant.output.ExportService.FileKind.DOCX;
 import static expenseassistant.output.ExportService.FileKind.XLSX;
@@ -221,33 +225,50 @@ class CaseWorkflowIT {
         Path batch = temporary.resolve("样本批次");
         SampleCorpus.verifyAndCopy(SampleCorpus.defaultSource(), batch);
         var app = new AppPaths(temporary, temporary.resolve("data"), temporary.resolve("cache"), temporary.resolve("成品"));
-        record Expected(String folder, long amount, String totalCell, int pages) {}
-        var inputs = List.of(new Expected("杭州出差-2026.10.21", 38_275, "K11", 3),
-                new Expected("深圳出差-2026.11.12~13", 247_230, "K11", 5),
-                new Expected("交通费", 13_100, "F12", 2));
         try (var ignored = InstanceLock.acquire(app.dataDirectory())) {
             var services = services(app);
             assertEquals(5, new PathPolicy(Database.open(app.databaseFile())).listCases(batch).size());
-            for (Expected expected : inputs) {
-                var info = services.cases.openCase(batch.resolve(expected.folder()));
-                var view = scan(services, info);
-                assertEquals(expected.amount(), view.confirmedTotal(), expected.folder());
-                assertEquals(expected.pages(), view.attachments().size(), expected.folder());
-                var result = services.export.generate(info.id(), view.info().revision(), app.defaultOutputRoot(), "corpus");
-                assertEquals(SUCCEEDED, result.state(), result.message());
-                try (var input = Files.newInputStream(services.export.verifiedFile(result.exportId(), XLSX));
-                     var workbook = new XSSFWorkbook(input)) {
-                    var total = new org.apache.poi.ss.util.CellReference(expected.totalCell());
-                    assertEquals(expected.amount(), cents(workbook.getSheetAt(0).getRow(total.getRow())
-                            .getCell(total.getCol()).getNumericCellValue()), expected.folder());
-                    if (expected.folder().startsWith("深圳出差")) {
-                        verifyShenzhen(workbook.getSheetAt(0));
-                    }
-                }
-                new WordWriter().verify(ExportSnapshot.fromDraft(view),
-                        services.export.verifiedFile(result.exportId(), DOCX));
-            }
+            var shenzhen = scan(services, services.cases.openCase(batch.resolve("深圳出差-2026.11.12~13")));
+            var hotel = shenzhen.items().stream().filter(item -> "HOTEL".equals(item.subtype())).findFirst().orElseThrow();
+            assertNull(hotel.fields().get("nights"));
+            assertTrue(hotel.reviewReasons().contains("HOTEL_NIGHTS_NEEDS_REVIEW"));
+            verifySamplePair(services, app, shenzhen, "shenzhen-initial", 247_230, 5,
+                    sheet -> verifyShenzhen(sheet, false));
+            var confirmed = services.drafts.apply(shenzhen.info().id(), shenzhen.info().revision(),
+                    List.of(new DraftService.SetField(hotel.id(), "nights", "1")));
+            assertEquals(shenzhen.info().revision() + 1, confirmed.info().revision());
+            verifySamplePair(services, app, confirmed, "shenzhen-confirmed", 247_230, 5,
+                    sheet -> verifyShenzhen(sheet, true));
+
+            var hangzhou = scan(services, services.cases.openCase(batch.resolve("杭州出差-2026.10.21")));
+            var stay = hangzhou.items().stream().filter(item -> "HOTEL".equals(item.subtype())).findFirst().orElseThrow();
+            assertEquals("1", stay.fields().get("nights"));
+            var rideAlong = services.drafts.apply(hangzhou.info().id(), hangzhou.info().revision(), List.of(
+                    new DraftService.SetField(stay.id(), "startDate", "2026-09-29"),
+                    new DraftService.SetField(stay.id(), "route", "宁波-杭州"),
+                    new DraftService.SetField(stay.id(), "vehicle", "随车")));
+            verifySamplePair(services, app, rideAlong, "hangzhou-ride-along", 38_275, 3, CaseWorkflowIT::verifyHangzhou);
+            var taxi = scan(services, services.cases.openCase(batch.resolve("交通费")));
+            verifySamplePair(services, app, taxi, "corpus", 13_100, 2,
+                    sheet -> assertMoney(sheet.getRow(11), Map.of(5, 13_100L)));
         }
+    }
+
+    private static void verifySamplePair(Services services, AppPaths app, CaseView view, String request,
+                                         long amount, int pages, Consumer<XSSFSheet> verifySheet) throws IOException {
+        assertEquals(amount, view.confirmedTotal(), view.info().folder().toString());
+        var result = services.export.generate(view.info().id(), view.info().revision(), app.defaultOutputRoot(), request);
+        assertEquals(SUCCEEDED, result.state(), result.message());
+        assertEquals(view.info().revision(), result.revision());
+        try (var input = Files.newInputStream(services.export.verifiedFile(result.exportId(), XLSX));
+             var workbook = new XSSFWorkbook(input)) {
+            verifySheet.accept(workbook.getSheetAt(0));
+        }
+        var snapshot = ExportSnapshot.fromDraft(view);
+        assertEquals(pages, snapshot.pages().size());
+        assertEquals(pages, snapshot.pages().stream().map(ExportSnapshot.AttachmentPage::relativePath).distinct().count());
+        assertTrue(snapshot.pages().stream().allMatch(page -> page.sourcePage() == 1));
+        new WordWriter().verify(snapshot, services.export.verifiedFile(result.exportId(), DOCX));
     }
 
     @Test
@@ -453,24 +474,73 @@ class CaseWorkflowIT {
         new WordWriter().verify(snapshot, services.export.verifiedFile(record.exportId(), DOCX));
     }
 
-    private static void verifyShenzhen(XSSFSheet sheet) {
+    private static void verifyShenzhen(XSSFSheet sheet, boolean nightsConfirmed) {
+        var outbound = sheet.getRow(2);
+        assertTrip(outbound, LocalDate.of(2026, 11, 12), "11月12日", "宁波-深圳", "飞机");
+        assertMoney(outbound, Map.of(3, 79_600L, 5, 50_000L, 6, 7_130L, 10, 136_730L));
+        assertBlank(outbound, 7, 8, 9);
+        var inbound = sheet.getRow(3);
+        assertTrip(inbound, LocalDate.of(2026, 11, 13), "11月13日", "深圳-宁波", "飞机");
+        assertMoney(inbound, Map.of(3, 110_500L, 10, 110_500L));
+        assertBlank(inbound, 4, 5, 6, 7, 8, 9);
+        var total = sheet.getRow(10);
+        assertMoney(total, Map.of(3, 190_100L, 5, 50_000L, 6, 7_130L, 10, 247_230L));
+        if (nightsConfirmed) {
+            assertEquals(1.0, outbound.getCell(4).getNumericCellValue());
+            assertEquals(CellType.FORMULA, total.getCell(4).getCellType());
+            assertEquals(1.0, total.getCell(4).getNumericCellValue());
+        } else {
+            assertBlank(outbound, 4);
+            assertEquals("", total.getCell(4).getStringCellValue());
+        }
+        assertUnusedTravelRows(sheet, 4);
+    }
+
+    private static void verifyHangzhou(XSSFSheet sheet) {
         var row = sheet.getRow(2);
-        assertEquals("2026-11-12\n2026-11-13", row.getCell(0).getStringCellValue());
-        assertTrue(List.of("宁波->深圳", "深圳").contains(row.getCell(1).getStringCellValue()));
-        assertEquals("飞机", row.getCell(2).getStringCellValue());
-        for (var entry : Map.of(3, 190_100L, 5, 50_000L, 6, 7_130L, 10, 247_230L).entrySet()) {
-            assertEquals(entry.getValue(), cents(row.getCell(entry.getKey()).getNumericCellValue()));
-            assertEquals(entry.getValue(), cents(sheet.getRow(10).getCell(entry.getKey()).getNumericCellValue()));
+        assertTrip(row, LocalDate.of(2026, 9, 29), "9月29日", "宁波-杭州", "随车");
+        assertBlank(row, 3, 7, 8, 9);
+        assertEquals(1.0, row.getCell(4).getNumericCellValue());
+        var amounts = Map.of(5, 36_465L, 6, 1_810L, 10, 38_275L);
+        assertMoney(row, amounts);
+        var total = sheet.getRow(10);
+        assertMoney(total, amounts);
+        assertEquals(1.0, total.getCell(4).getNumericCellValue());
+        assertEquals("", total.getCell(3).getStringCellValue());
+        assertUnusedTravelRows(sheet, 3);
+    }
+
+    private static void assertTrip(Row row, LocalDate expected, String display, String route, String vehicle) {
+        var date = row.getCell(0);
+        assertEquals(CellType.NUMERIC, date.getCellType());
+        assertEquals(expected, date.getLocalDateTimeCellValue().toLocalDate());
+        assertEquals("m\"月\"d\"日\"", date.getCellStyle().getDataFormatString());
+        assertEquals(display, CellFormat.getInstance(Locale.CHINA, date.getCellStyle().getDataFormatString()).apply(date).text);
+        assertEquals(route, row.getCell(1).getStringCellValue());
+        assertEquals(vehicle, row.getCell(2).getStringCellValue());
+    }
+
+    private static void assertMoney(Row row, Map<Integer, Long> expected) {
+        expected.forEach((column, minor) ->
+                assertEquals(minor.longValue(), cents(row.getCell(column).getNumericCellValue()), row.getCell(column).getAddress().formatAsString()));
+    }
+
+    private static void assertBlank(Row row, int... columns) {
+        for (int column : columns) {
+            assertNull(row.getCell(column, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL),
+                    "第 " + (row.getRowNum() + 1) + " 行，第 " + (column + 1) + " 列");
         }
-        for (int column : new int[]{4, 7, 8, 9}) {
-            assertNull(row.getCell(column, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL));
-            assertEquals("", sheet.getRow(10).getCell(column).getStringCellValue());
+    }
+
+    private static void assertUnusedTravelRows(XSSFSheet sheet, int unusedFrom) {
+        for (int index = unusedFrom; index < 10; index++) {
+            var row = sheet.getRow(index);
+            assertBlank(row, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+            assertEquals("", row.getCell(10).getStringCellValue());
         }
-        for (int index = 3; index < 10; index++) {
-            for (int column = 0; column < 10; column++) {
-                assertNull(sheet.getRow(index).getCell(column, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL));
-            }
-            assertEquals("", sheet.getRow(index).getCell(10).getStringCellValue());
+        var total = sheet.getRow(10);
+        for (int column : new int[]{7, 8, 9}) {
+            assertEquals("", total.getCell(column).getStringCellValue());
         }
     }
 

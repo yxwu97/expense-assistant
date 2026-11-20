@@ -162,16 +162,7 @@ public final class RecognitionService {
                     text = new PageResult(page, Kind.UNKNOWN, true, List.of(), List.of(), List.of(),
                             List.of("PDF_TEXT_UNAVAILABLE"), version);
                 }
-                PageResult result = text;
-                if (!parser.reliable(text)) {
-                    try {
-                        BufferedImage rendered = renderer.renderImageWithDPI(page - 1, OCR_DPI, ImageType.RGB);
-                        result = ocr(rendered, null, text, jobId, version, cancelled);
-                    } catch (IOException | IllegalArgumentException failure) {
-                        result = new PageResult(page, text.kind(), false, text.fields(), text.segments(),
-                                text.summaryReferences(), append(text.warnings(), "PAGE_UNRENDERABLE"), version);
-                    }
-                }
+                PageResult result = completePdfPage(renderer, text, jobId, version, cancelled);
                 pages.add(result);
                 log(jobId, page, start, result.warnings().isEmpty() ? "OK" : result.warnings().getFirst());
             }
@@ -181,6 +172,38 @@ public final class RecognitionService {
         } catch (IOException | IllegalArgumentException unrenderable) {
             return List.of(unrenderable(onlyPage == 0 ? 1 : onlyPage, version, "PAGE_UNRENDERABLE"));
         }
+    }
+
+    private PageResult completePdfPage(PDFRenderer renderer, PageResult text, String jobId, String version,
+                                       BooleanSupplier cancelled) {
+        boolean required = !parser.reliable(text);
+        boolean supplementNights = "HOTEL".equals(text.value("subtype")) && text.fields().stream().noneMatch(
+                field -> PageParser.NIGHTS.equals(field.key()) && field.normalized() != null);
+        if (!required && !supplementNights) {
+            return text;
+        }
+        try {
+            checkCancelled(cancelled);
+            var rendered = renderer.renderImageWithDPI(text.pageNo() - 1, OCR_DPI, ImageType.RGB);
+            return required ? ocr(rendered, null, text, jobId, version, cancelled)
+                    : supplementHotelNights(rendered, text, jobId, version, cancelled);
+        } catch (IOException | IllegalArgumentException failure) {
+            return new PageResult(text.pageNo(), text.kind(), false, text.fields(), text.segments(),
+                    text.summaryReferences(), append(text.warnings(), "PAGE_UNRENDERABLE"), version);
+        }
+    }
+
+    private PageResult supplementHotelNights(BufferedImage image, PageResult text, String jobId, String version,
+                                             BooleanSupplier cancelled) {
+        var attempt = runner.recognize(image, jobId, text.pageNo(), 3, cancelled);
+        if (attempt.error() != null) {
+            return new PageResult(text.pageNo(), text.kind(), text.renderable(), text.fields(), text.segments(),
+                    text.summaryReferences(), append(text.warnings(), attempt.error()), version);
+        }
+        var fields = new ArrayList<>(text.fields());
+        fields.addAll(parser.extractHotelNights(attempt.text()));
+        return new PageResult(text.pageNo(), text.kind(), text.renderable(), fields, text.segments(),
+                text.summaryReferences(), text.warnings(), version);
     }
 
     private List<PageResult> image(Path snapshot, String jobId, String version, BooleanSupplier cancelled) {

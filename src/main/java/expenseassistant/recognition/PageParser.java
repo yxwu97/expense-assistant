@@ -20,7 +20,8 @@ import expenseassistant.recognition.PageResult.SummaryReference;
 import expenseassistant.recognition.PageResult.TripSegment;
 
 public final class PageParser {
-    public static final String VERSION = "4";
+    public static final String VERSION = "5";
+    static final String NIGHTS = "nights";
     private static final int FLAGS = Pattern.UNICODE_CHARACTER_CLASS | Pattern.CASE_INSENSITIVE;
     private static final String MONEY = "([0-9]+(?:[.,][0-9]{1,2})?)(?![0-9.,])";
     private static final String DATE = "(20[0-9]{2}\\s*(?:年|[./-])\\s*[0-9]{1,2}\\s*(?:月|[./-])\\s*[0-9]{1,2}\\s*日?)(?![0-9])";
@@ -74,7 +75,8 @@ public final class PageParser {
     private static final Pattern TIMESTAMPS = pattern("(?<![0-9])(20[0-9]{6})(?:[0-9]{6})?(?![0-9])");
     private static final Pattern TOLL_DATES = pattern("(?<![0-9])(20[0-9]{6})\\h+(20[0-9]{6})(?![0-9])");
     private static final Pattern PARKING_DATES = pattern("租赁期起止\\s*[:：]?\\s*" + DATE + "\\h+[0-9:]+\\h+" + DATE);
-    private static final Pattern HOTEL_DATES = pattern("入住(?:日期|时间)?\\s*[:：]?\\s*" + DATE + "[^\\r\\n]{0,25}?(?:离店|退房)(?:日期|时间)?\\s*[:：]?\\s*" + DATE);
+    private static final Pattern HOTEL_CHECK_IN = pattern("入住(?:日期|时间)?\\s*[:：]?\\s*" + DATE);
+    private static final Pattern HOTEL_CHECK_OUT = pattern("(?:离店|退房)(?:日期|时间)?\\s*[:：]?\\s*" + DATE);
     private static final String TICKET_ORIGIN = "(?:出发(?:地|站|机场|城市)|始发(?:地|站|机场)|起飞(?:地|机场)|起点)";
     private static final String TICKET_DESTINATION = "(?:到达(?:地|站|机场|城市)|抵达(?:地|站|机场)|目的地|终点)";
     private static final String TICKET_PLACE = "([\\p{IsHan}·]{1,24}?)";
@@ -92,7 +94,17 @@ public final class PageParser {
             + "(?:\\h*[至~～]\\h*" + DATE + ")?");
     private static final Pattern TICKET_ARRIVAL = pattern("(?:到达|抵达|降落)(?:日期|时间)\\h*[:：]?\\h*" + DATE);
     private static final Pattern RAIL_DEPARTURE = pattern(DATE + "\\h+[0-9]{1,2}[:：][0-9]{2}\\h*开(?!票)");
-    private static final Pattern QUANTITY = pattern("住\\s*宿\\s*费[^\\r\\n]{0,24}?天\\h+" + MONEY);
+    private static final String STAY_QUANTITY = "[0-9０-９]+(?:[.．][0-9０-９]+)?(?![0-9０-９.,．，])";
+    private static final String STAY_ITEM = "(?:住\\h*宿\\h*费|房\\h*费)";
+    private static final String ROOM_SPECIFICATION = "(?:\\h*[(（][^\\r\\n)）*]{1,24}[)）]"
+            + "|\\h+(?:(?:商务|豪华|高级|经济|普通|无窗)?(?:双床|大床|单人|双人)[房间]"
+            + "|(?:标准|商务|豪华|高级|经济|普通)[房间]|标间|单间|套房|客房|-{1,2}))?";
+    private static final Pattern QUANTITY = pattern(STAY_ITEM + ROOM_SPECIFICATION
+            + "\\h*([天晚夜]\\h*" + STAY_QUANTITY + ")(?!\\p{L})");
+    private static final Pattern DECLARED_STAY_QUANTITY = pattern("住\\h*宿\\h*[天晚夜]\\h*数"
+            + "\\h*[:：]?\\h*(" + STAY_QUANTITY + "(?:\\h*[天晚夜])?+)(?!\\h*(?:[个间人张套]|小时))");
+    private static final Pattern STAY_DURATION = pattern("(?:" + STAY_ITEM + "|住\\h*宿(?:\\h*时\\h*长)?)"
+            + "\\h*[:：]?\\h*(" + STAY_QUANTITY + "\\h*[天晚夜])(?![餐饭点时])");
     private static final Pattern ORDER_ID = pattern("(?:订单号|订单编号|order\\s+id)\\s*[:：]?\\s*([A-Z0-9]{5,32})(?![A-Z0-9])");
     private static final Pattern APPLE_DOCUMENT = pattern("(?:文\\s*稿(?:号)?|document\\s+no\\.?)\\s*[:：]?\\s*([0-9]{8,24})(?![0-9])");
     private static final Pattern APPLE_RENEWAL = pattern(DATE + "\\s*(?:续\\s*期|renew)");
@@ -228,8 +240,9 @@ public final class PageParser {
             fields.range(PARKING_DATES, PageParser::date, "停车服务起止时间");
         } else if (text.contains("住宿") || text.contains("房费")) {
             fields.rule("subtype", "HOTEL", "住宿或代订房费");
-            fields.range(HOTEL_DATES, PageParser::date, "入住及离店日期");
-            fields.capture("nights", QUANTITY, 1, PageParser::decimal, "住宿费的天数");
+            fields.capture("startDate", HOTEL_CHECK_IN, 1, PageParser::date, "入住日期");
+            fields.capture("endDate", HOTEL_CHECK_OUT, 1, PageParser::date, "离店日期");
+            hotelNights(fields);
         } else if (text.contains("代驾")) {
             fields.rule("subtype", "DRIVER", "代驾服务");
         } else if (text.toLowerCase(Locale.ROOT).contains("didi") || text.contains("滴滴")) {
@@ -248,6 +261,24 @@ public final class PageParser {
         if (text.toLowerCase(Locale.ROOT).contains("didi") || text.contains("滴滴")) {
             fields.rule("platform", "DIDI", "滴滴标识");
         }
+    }
+
+    List<FieldCandidate> extractHotelNights(PageText source) {
+        var fields = new Fields(source);
+        hotelNights(fields);
+        return List.copyOf(fields.candidates);
+    }
+
+    private static void hotelNights(Fields fields) {
+        fields.capture(NIGHTS, QUANTITY, 1, PageParser::positiveNights, "住宿项目的计量单位及数量");
+        fields.capture(NIGHTS, STAY_DURATION, 1, PageParser::positiveNights, "明确标注的住宿时长");
+        fields.capture(NIGHTS, DECLARED_STAY_QUANTITY, 1, PageParser::positiveNights, "明确标注的住宿天数");
+    }
+
+    private static String positiveNights(String raw) {
+        String digits = Normalizer.normalize(raw, Normalizer.Form.NFKC).replaceAll("[\\h天晚夜]", "");
+        var quantity = new BigDecimal(digits).stripTrailingZeros();
+        return quantity.signum() > 0 && quantity.scale() <= 0 ? quantity.toPlainString() : null;
     }
 
     private static Pattern ticketPlace(String label) {

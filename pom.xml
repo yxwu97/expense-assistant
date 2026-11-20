@@ -5,7 +5,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>expenseassistant</groupId>
     <artifactId>expense-assistant</artifactId>
-    <version>1.0.20261120001</version>
+    <version>1.0.20261120002</version>
     <name>报销助手</name>
 
     <properties>

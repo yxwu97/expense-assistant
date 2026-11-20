@@ -3,6 +3,7 @@ package expenseassistant.output;
 import expenseassistant.casework.CaseException;
 import expenseassistant.intake.TypeInference.CaseType;
 import expenseassistant.output.ExportSnapshot.ExpenseRow;
+import org.apache.poi.ss.format.CellFormat;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
 import org.apache.poi.ss.usermodel.DateUtil;
@@ -13,10 +14,12 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.IntStream;
 
@@ -55,6 +58,10 @@ class ExcelWriterTest {
                 assertEquals(1, sheet.getPrintSetup().getFitWidth());
                 var firstDate = sheet.getRow(layout.firstRow() - 1).getCell(0);
                 assertTrue(DateUtil.isCellDateFormatted(firstDate));
+                assertEquals(type == CaseType.TRAVEL ? "m\"月\"d\"日\"" : "yyyy-mm-dd",
+                        firstDate.getCellStyle().getDataFormatString());
+                var lastColumn = org.apache.poi.ss.util.CellReference.convertNumToColString(layout.columns() - 1);
+                assertTrue(book.getPrintArea(0).endsWith("!$A$1:$" + lastColumn + "$" + (layout.printLastRow() + extra)));
                 var total = sheet.getRow(layout.totalRow() + extra - 1).getCell(layout.totalColumn());
                 assertEquals(IntStream.range(0, count).mapToDouble(i -> (100 + i) / 100.0).sum(),
                         total.getNumericCellValue(), 0.00001);
@@ -99,14 +106,75 @@ class ExcelWriterTest {
         try (var stream = Files.newInputStream(partialFile); var book = new XSSFWorkbook(stream)) {
             var sheet = book.getSheetAt(0);
             var line = sheet.getRow(2);
-            assertEquals("2026-11-12\n2026-11-13", line.getCell(0).getStringCellValue());
-            assertTrue(line.getHeightInPoints() > 20);
+            var dateCell = line.getCell(0);
+            assertEquals(CellType.NUMERIC, dateCell.getCellType());
+            assertEquals(LocalDate.of(2026, 11, 12), dateCell.getLocalDateTimeCellValue().toLocalDate());
+            assertEquals("11月12日",
+                    CellFormat.getInstance(Locale.CHINA, dateCell.getCellStyle().getDataFormatString()).apply(dateCell).text);
             assertEquals(CellType.BLANK, line.getCell(3).getCellType());
             assertEquals(2, line.getCell(4).getNumericCellValue());
             assertEquals(131, line.getCell(6).getNumericCellValue());
             assertEquals(CellType.BLANK, line.getCell(7).getCellType());
-            assertEquals(131, sheet.getRow(10).getCell(10).getNumericCellValue());
+            assertEquals(131, line.getCell(10).getNumericCellValue());
+            var total = sheet.getRow(10);
+            assertEquals(2, total.getCell(4).getNumericCellValue());
+            assertEquals(131, total.getCell(10).getNumericCellValue());
         }
+    }
+
+    @Test
+    void travelKeepsDateAndRouteIndependentAndWritesConfirmedAmounts() throws Exception {
+        var start = LocalDate.of(2026, 11, 3);
+        var snapshot = snapshot(CaseType.TRAVEL, List.of(
+                new ExpenseRow("date-only", "TRAVEL_SUMMARY", start, null, "差旅", Map.of(), Map.of("TRANSPORT", 79600L)),
+                new ExpenseRow("route-only", "TRAVEL_SUMMARY", null, start.plusDays(1), "差旅",
+                        Map.of("route", "深圳-宁波"), Map.of("TRANSPORT", 0L)),
+                new ExpenseRow("unlocated", "TRAVEL_SUMMARY", null, null, "差旅", Map.of(), Map.of("HOTEL", 50000L))));
+        Path target = scratch.resolve("差旅-行程待核对.xlsx");
+        writer.write(snapshot, target);
+        writer.evaluateAndVerify(snapshot, target);
+        try (var stream = Files.newInputStream(target); var book = new XSSFWorkbook(stream)) {
+            var sheet = book.getSheetAt(0);
+            var dateOnly = sheet.getRow(2);
+            var dateCell = dateOnly.getCell(0);
+            assertEquals(start, dateCell.getLocalDateTimeCellValue().toLocalDate());
+            assertEquals("11月3日",
+                    CellFormat.getInstance(Locale.CHINA, dateCell.getCellStyle().getDataFormatString()).apply(dateCell).text);
+            assertEquals(CellType.BLANK, dateOnly.getCell(1).getCellType());
+            assertEquals(796, dateOnly.getCell(3).getNumericCellValue());
+            var routeOnly = sheet.getRow(3);
+            assertEquals(CellType.BLANK, routeOnly.getCell(0).getCellType());
+            assertEquals("深圳-宁波", routeOnly.getCell(1).getStringCellValue());
+            assertEquals(CellType.NUMERIC, routeOnly.getCell(3).getCellType());
+            assertEquals(0, routeOnly.getCell(3).getNumericCellValue());
+            assertEquals(CellType.NUMERIC, routeOnly.getCell(10).getCachedFormulaResultType());
+            assertEquals(0, routeOnly.getCell(10).getNumericCellValue());
+            var unlocated = sheet.getRow(4);
+            assertEquals(CellType.BLANK, unlocated.getCell(0).getCellType());
+            assertEquals(CellType.BLANK, unlocated.getCell(1).getCellType());
+            assertEquals(CellType.BLANK, unlocated.getCell(3).getCellType());
+            assertEquals(500, unlocated.getCell(5).getNumericCellValue());
+            assertEquals(1296, sheet.getRow(10).getCell(10).getNumericCellValue());
+        }
+    }
+
+    @Test
+    void rejectsAnIncorrectTravelDateFormatEvenWhenTheNumericDateMatches() throws Exception {
+        var snapshot = snapshot(CaseType.TRAVEL, List.of(row(CaseType.TRAVEL).withAmount(100L)));
+        Path correct = scratch.resolve("差旅-日期格式.xlsx");
+        Path altered = scratch.resolve("差旅-日期格式不符.xlsx");
+        writer.write(snapshot, correct);
+        try (var stream = Files.newInputStream(correct); var book = new XSSFWorkbook(stream);
+             var output = Files.newOutputStream(altered)) {
+            var date = book.getSheetAt(0).getRow(2).getCell(0);
+            var style = book.createCellStyle();
+            style.cloneStyleFrom(date.getCellStyle());
+            style.setDataFormat(book.createDataFormat().getFormat("yyyy-mm-dd"));
+            date.setCellStyle(style);
+            book.write(output);
+        }
+        var error = assertThrows(IOException.class, () -> writer.evaluateAndVerify(snapshot, altered));
+        assertTrue(error.getMessage().contains("差旅日期格式不符 A3"));
     }
 
     @Test
@@ -147,6 +215,7 @@ class ExcelWriterTest {
         try (var stream = Files.newInputStream(target); var book = new XSSFWorkbook(stream)) {
             var detail = book.getSheetAt(0).getRow(3);
             var cell = detail.getCell(taxi ? 8 : 4);
+            assertEquals("2026-11-12\n2026-11-13", detail.getCell(0).getStringCellValue());
             assertEquals(narrative, cell.getStringCellValue());
             assertEquals(taxi ? "宋体" : "微软雅黑", cell.getCellStyle().getFont().getFontName());
             assertEquals(10, cell.getCellStyle().getFont().getFontHeightInPoints());

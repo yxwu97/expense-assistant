@@ -32,16 +32,16 @@ class RecognitionServiceTest {
     @TempDir Path scratch;
 
     @Test
-    void qualifiedPdfTextDoesNotInvokeOcr() throws Exception {
+    void qualifiedPdfTextKeepsBillingEvidenceAndOnlySupplementsMissingHotelNights() throws Exception {
         Path batch = scratch.resolve("copy");
         var samples = SampleCorpus.verifyAndCopy(SampleCorpus.defaultSource(), batch);
-        AtomicInteger attempts = new AtomicInteger();
+        var attempts = new ArrayList<String>();
         var workspace = new OcrWorkspace(scratch);
         var ocr = new TesseractRunner(scratch.resolve("none"), scratch, workspace) {
             @Override
             OcrResult recognize(java.awt.image.BufferedImage img, String job, int page, int psm,
                                 java.util.function.BooleanSupplier cancel) {
-                attempts.incrementAndGet();
+                attempts.add(job);
                 return new OcrResult(null, "OCR_UNAVAILABLE");
             }
         };
@@ -64,6 +64,8 @@ class RecognitionServiceTest {
                 assertEquals(expected.get("invoiceNumberSha256"), sha(page.value("invoiceNumber")), fixture.id());
                 assertEquals(expected.get("invoiceDate"), page.value("invoiceDate"), fixture.id());
             }
+            if ("P03".equals(fixture.id())) assertEquals("1", page.value("nights"));
+            if ("P16".equals(fixture.id())) assertNull(page.value("nights"));
             if (expected.containsKey("segmentAmounts")) {
                 assertEquals(List.of(7300L, 5800L), page.segments().stream().map(PageResult.TripSegment::minor).toList());
             }
@@ -73,8 +75,85 @@ class RecognitionServiceTest {
                 assertEquals(expected.get("businessDate"), page.value("startDate"), fixture.id());
             }
         }
-        assertEquals(0, attempts.get());
+        assertEquals(List.of("P16"), attempts);
         assertWorkspaceEmpty();
+    }
+
+    @Test
+    void hotelNightsRequireExplicitStayUnitsOrAnExpresslyLabelledCount() {
+        var days = controlledInvoice("住宿费 天 1\n入住日期：2026-11-12\n离店日期：2026-11-13");
+        var candidate = days.field("nights").orElseThrow();
+        assertEquals("1", candidate.normalized());
+        assertEquals("天 1", candidate.raw());
+        assertEquals(Method.PDF_TEXT, candidate.method());
+        assertEquals(new PageResult.Bounds(0.1, 0.1, 0.5, 0.5), candidate.bounds());
+        assertEquals("2026-11-12", days.value("startDate"));
+        assertEquals("2026-11-13", days.value("endDate"));
+        assertEquals("2", controlledInvoice("住宿 2 晚").value("nights"));
+        assertEquals("1", controlledInvoice("住宿费 标准间 天 1").value("nights"));
+        assertEquals("1", controlledInvoice("房费 豪华双床房 夜 1.00").value("nights"));
+        assertEquals("1", controlledInvoice("代订房费 个 1.00\n住宿天数：１．００").value("nights"));
+        var unrelated = List.of("代订房费 个 1.00", "房费 间夜 2", "房费 间 2", "住宿费 天 0", "住宿费 天 1.5",
+                "住宿费\n其他服务 天 2", "住宿费 其他服务 天 2", "住宿费 个 1.00 *预订服务*场地费 天 2",
+                "住宿时长：2 小时", "住宿 2 晚餐", "住宿天数：1 小时");
+        for (String text : unrelated) {
+            assertNull(controlledInvoice(text).value("nights"), text);
+        }
+    }
+
+    @Test
+    void differentHotelQuantitiesRemainReviewableWithoutBlockingTheAmount() {
+        var conflict = controlledInvoice("住宿费 天 1.00\n住宿 2 晚");
+        assertNull(conflict.value("nights"));
+        assertEquals(List.of("1", "2"), conflict.fields().stream().filter(field -> "nights".equals(field.key()))
+                .map(PageResult.FieldCandidate::normalized).toList());
+        assertEquals(79600L, conflict.faceMinor());
+        assertTrue(new PageParser().reliable(conflict));
+        assertEquals("1", controlledInvoice("住宿费 天 1.00\n住宿天数：1").value("nights"));
+    }
+
+    @Test
+    void optionalHotelOcrAddsOnlyNightCandidatesAndRetainsPdfAmountAfterConflictOrTimeout() throws Exception {
+        Path batch = scratch.resolve("copy");
+        var sample = SampleCorpus.verifyAndCopy(SampleCorpus.defaultSource(), batch).stream()
+                .filter(entry -> "P16".equals(entry.id())).findFirst().orElseThrow();
+        Path file = batch.resolve(sample.relativePath());
+        var timeout = hotelOcr(file, sample.sha256(), null);
+        assertTrue(timeout.warnings().contains("OCR_TIMEOUT"));
+        assertNull(timeout.value("nights"));
+        var supplement = hotelOcr(file, sample.sha256(), "住宿 2 晚\n价税合计：USD 999.00");
+        var candidate = supplement.field("nights").orElseThrow();
+        assertEquals("2", candidate.normalized());
+        assertEquals("2 晚", candidate.raw());
+        assertEquals(Method.OCR, candidate.method());
+        assertNotNull(candidate.bounds());
+        var conflict = hotelOcr(file, sample.sha256(), "住宿费 天 1\n住宿 2 晚");
+        assertNull(conflict.value("nights"));
+        assertEquals(2, conflict.fields().stream().filter(field -> "nights".equals(field.key())).count());
+        var other = hotelOcr(file, sample.sha256(), "房费 个 1.00\n其他服务 天 2");
+        assertNull(other.value("nights"));
+        for (var result : List.of(timeout, supplement, conflict, other)) {
+            assertEquals(50000L, result.faceMinor());
+            assertTrue(result.renderable());
+            assertTrue(new PageParser().reliable(result));
+            assertEquals(timeout.fields(), result.fields().stream().filter(field -> !"nights".equals(field.key())).toList());
+        }
+        assertWorkspaceEmpty();
+    }
+
+    private PageResult hotelOcr(Path file, String hash, String recognized) {
+        var workspace = new OcrWorkspace(scratch);
+        var runner = new TesseractRunner(scratch.resolve("unused"), scratch, workspace) {
+            @Override
+            OcrResult recognize(BufferedImage image, String job, int page, int psm,
+                                java.util.function.BooleanSupplier cancel) {
+                if (recognized == null) return new OcrResult(null, "OCR_TIMEOUT");
+                var text = new PageText.Builder();
+                text.append(recognized, new PageResult.Bounds(0.1, 0.1, 0.5, 0.5));
+                return new OcrResult(text.toPageText(Method.OCR), null);
+            }
+        };
+        return new RecognitionService(runner, workspace).extract(file, hash, "hotel-supplement").getFirst();
     }
 
     @Test

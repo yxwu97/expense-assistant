@@ -21,6 +21,7 @@ import expenseassistant.store.Database;
 import expenseassistant.store.InstanceLock;
 import expenseassistant.store.StoreException;
 import expenseassistant.support.ReceiptFixtures;
+import expenseassistant.support.SampleCorpus;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.junit.jupiter.api.Test;
@@ -30,6 +31,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -41,6 +43,8 @@ import java.time.Duration;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -336,6 +340,131 @@ class ExportRecoveryTest {
         assertNull(otherAmount(old));
         verifyPair(reopened, old);
         verifyPair(reopened, current);
+    }
+
+    @Test
+    void legacyTravelPairReplaysAndNewRequestsSplitTheSameRevisionAfterAnInterruption() throws Exception {
+        Path directory = testDirectory.toRealPath();
+        var service = services(directory, null, ExportPublisher::atomicMove, (point, record) -> {});
+        var draft = scanTravelTickets(directory, service);
+        String id = draft.info().id();
+        long revision = draft.info().revision();
+        Path output = service.paths().defaultOutputRoot();
+        var old = seedLegacyTravelPair(service, draft, output);
+        verifyPair(service, old);
+        assertLegacyTravelSheet(old);
+
+        var stopped = services(directory, null, ExportPublisher::atomicMove, (point, record) -> {
+            if (point == Boundary.GENERATING) throw new SimulatedStop();
+        });
+        try (var lock = InstanceLock.acquire(stopped.paths().dataDirectory())) {
+            assertThrows(SimulatedStop.class, () -> stopped.exports().generate(id, revision, output, "interrupted-travel"));
+        }
+        var reopened = services(directory, null, ExportPublisher::atomicMove, (point, record) -> {});
+        try (var lock = InstanceLock.acquire(reopened.paths().dataDirectory())) {
+            var recovered = reopened.exports().recover();
+            assertEquals(1, recovered.size());
+            var failed = recovered.getFirst();
+            assertEquals(State.FAILED, failed.state());
+            assertEquals("GENERATION_INTERRUPTED", failed.errorCode());
+            assertEquals(failed, reopened.exports().generate(id, revision, output, "interrupted-travel"));
+            assertTrue(reopened.exports().recover().isEmpty());
+        }
+        assertEquals(old.exportId(), reopened.cases().load(id).currentExportId());
+        assertEquals(old, reopened.exports().generate(id, revision, output, "legacy-travel"));
+        verifyPair(reopened, old);
+
+        var current = reopened.exports().generate(id, revision, output, "split-travel");
+        assertEquals(State.SUCCEEDED, current.state(), current.message());
+        assertNotEquals(old.exportId(), current.exportId());
+        assertEquals(revision, current.revision());
+        assertEquals(current.exportId(), reopened.cases().load(id).currentExportId());
+        assertSplitTravelSheet(current);
+        verifyPair(reopened, current);
+        assertEquals(old, reopened.exports().generate(id, revision, output, "legacy-travel"));
+        verifyPair(reopened, old);
+        assertLegacyTravelSheet(old);
+    }
+
+    private static CaseView scanTravelTickets(Path directory, Services service) throws IOException {
+        Path original = SampleCorpus.defaultSource();
+        var selected = SampleCorpus.verify(original).stream().filter(entry -> Set.of("P14", "P15").contains(entry.id())).toList();
+        assertEquals(2, selected.size());
+        Path batch = Files.createDirectory(directory.resolve("样本批次"));
+        Path folder = Files.createDirectory(batch.resolve(selected.getFirst().caseFolder()));
+        for (var entry : selected) {
+            Path source = original.resolve(entry.relativePath());
+            Files.copy(source, folder.resolve(source.getFileName()));
+        }
+        var info = service.cases().openCase(batch, folder);
+        try (var ticket = service.scans().begin(info.id(), info.revision())) {
+            return service.drafts().mergeScan(service.scans().scan(ticket));
+        }
+    }
+
+    private static Record seedLegacyTravelPair(Services service, CaseView draft, Path output) throws IOException {
+        var saved = service.exports().generate(draft.info().id(), draft.info().revision(), output, "legacy-travel");
+        assertEquals(State.SUCCEEDED, saved.state(), saved.message());
+        var snapshot = ExportSnapshot.fromDraft(draft);
+        var rows = snapshot.rows();
+        assertEquals(2, rows.size());
+        var first = rows.getFirst();
+        var last = rows.getLast();
+        var legacyRow = new ExportSnapshot.ExpenseRow(first.itemId(), first.subtype(), first.startDate(), last.startDate(),
+                "深圳", Map.of("route", "深圳", "vehicle", "飞机"), Map.of("TRANSPORT", 190_100L));
+        var legacy = new ExportSnapshot(snapshot.caseId(), snapshot.caseName(), snapshot.caseFolder(), snapshot.type(),
+                snapshot.revision(), snapshot.templateHash(), snapshot.ruleVersion(), List.of(legacyRow),
+                snapshot.pages(), snapshot.unavailable(), snapshot.audit());
+        var xlsx = saved.file(FileKind.XLSX).path();
+        // Recreate the prior workbook layout inside the isolated fixture.
+        try (var book = new XSSFWorkbook(new ByteArrayInputStream(Files.readAllBytes(xlsx)))) {
+            var sheet = book.getSheetAt(0);
+            var outbound = sheet.getRow(2);
+            outbound.getCell(0).setCellValue(first.startDate() + "\n" + last.startDate());
+            outbound.getCell(1).setCellValue("深圳");
+            outbound.getCell(3).setCellValue(1901.0);
+            for (int col = 0; col < 10; col++) sheet.getRow(3).getCell(col).setBlank();
+            book.getCreationHelper().createFormulaEvaluator().evaluateAll();
+            try (var stream = Files.newOutputStream(xlsx)) {
+                book.write(stream);
+            }
+        }
+        String json = new ObjectMapper().registerModule(new JavaTimeModule()).writeValueAsString(legacy);
+        String digest = TemplateArchive.sha256(xlsx);
+        long size = Files.size(xlsx);
+        Database.open(service.paths().databaseFile()).transaction(connection -> {
+            update(connection, "UPDATE export_record SET snapshot_json=? WHERE export_id=?", json, saved.exportId());
+            update(connection, "UPDATE export_file SET sha256=?,size=? WHERE export_id=? AND kind='XLSX'",
+                    digest, size, saved.exportId());
+            return null;
+        });
+        return service.exports().query(saved.exportId());
+    }
+
+    private static void assertLegacyTravelSheet(Record record) throws IOException {
+        try (var input = Files.newInputStream(record.file(FileKind.XLSX).path());
+             var workbook = new XSSFWorkbook(input)) {
+            var sheet = workbook.getSheetAt(0);
+            assertEquals("2026-11-12\n2026-11-13", sheet.getRow(2).getCell(0).getStringCellValue());
+            assertEquals(1901.0, sheet.getRow(2).getCell(3).getNumericCellValue());
+            assertNull(sheet.getRow(3).getCell(3, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL));
+        }
+    }
+
+    private static void assertSplitTravelSheet(Record record) throws IOException {
+        try (var input = Files.newInputStream(record.file(FileKind.XLSX).path());
+             var workbook = new XSSFWorkbook(input)) {
+            var sheet = workbook.getSheetAt(0);
+            var outbound = sheet.getRow(2);
+            var inbound = sheet.getRow(3);
+            assertEquals(LocalDate.of(2026, 11, 12), outbound.getCell(0).getLocalDateTimeCellValue().toLocalDate());
+            assertEquals(LocalDate.of(2026, 11, 13), inbound.getCell(0).getLocalDateTimeCellValue().toLocalDate());
+            assertEquals("宁波-深圳", outbound.getCell(1).getStringCellValue());
+            assertEquals("深圳-宁波", inbound.getCell(1).getStringCellValue());
+            assertEquals(796.0, outbound.getCell(3).getNumericCellValue());
+            assertEquals(1105.0, inbound.getCell(3).getNumericCellValue());
+            assertEquals(1901.0, sheet.getRow(10).getCell(10).getNumericCellValue());
+        }
     }
 
     private static void seedLegacyUsdAmounts(AppPaths paths, String id) {
