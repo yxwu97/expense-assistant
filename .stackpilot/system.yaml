@@ -1,0 +1,9 @@
+apiVersion: stackpilot.io/v1alpha1
+kind: System
+metadata:
+  id: expense-assistant
+  name: Expense Assistant
+spec:
+  desktopApp:
+    bundlePath: release/macos-arm64/ExpenseAssistant.app
+    bundleId: com.expenseassistant.desktop

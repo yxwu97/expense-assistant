@@ -1,0 +1,27 @@
+/.DS_Store
+**/.DS_Store
+/data/
+/target/
+/release/
+/.idea/
+/.vscode/
+*.iml
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+*.log
+/.expense-assistant/
+/报销助手输出/
+
+# Local development and reimbursement records
+/AGENTS.md
+/CLAUDE.md
+/design/
+/plan/
+/prompt/
+/plan-review-reports/
+/validation/
+/src/test/resources/corpus-manifest.json

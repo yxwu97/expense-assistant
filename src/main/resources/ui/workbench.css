@@ -1,0 +1,117 @@
+.workbench, .workbench > .viewport {
+    -fx-background-color: #eef2f8;
+}
+
+.workbench-content {
+    -fx-font-size: 13px;
+    -fx-text-fill: #182334;
+}
+
+.workbench .label {
+    -fx-text-fill: #182334;
+}
+
+.workbench .app-title {
+    -fx-font-weight: bold;
+    -fx-font-size: 20px;
+}
+
+.workbench .app-mark {
+    -fx-image: url("expense-assistant.png");
+}
+
+.workbench .workbench-card {
+    -fx-padding: 14px;
+    -fx-background-color: #ffffff;
+    -fx-border-color: #dbe3ed;
+    -fx-background-radius: 8px;
+    -fx-border-radius: 8px;
+}
+
+.workbench .review-pane {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-padding: 0;
+}
+
+.workbench .review-pane > .split-pane-divider {
+    -fx-background-color: transparent;
+    -fx-padding: 0.35em;
+}
+
+.workbench .section-title, .workbench .folder-title {
+    -fx-font-size: 15px;
+    -fx-font-weight: bold;
+}
+
+.workbench .quiet {
+    -fx-text-fill: #52627a;
+    -fx-font-size: 12px;
+}
+
+.workbench .warning {
+    -fx-text-fill: #785013;
+    -fx-font-size: 12px;
+}
+
+.workbench .total-value {
+    -fx-font-size: 22px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #163f96;
+}
+
+.workbench .button, .workbench .toggle-button {
+    -fx-background-color: #f5f8fd;
+    -fx-border-color: #d8e2f1;
+    -fx-border-radius: 5px;
+    -fx-background-radius: 5px;
+    -fx-padding: 5px 10px;
+}
+
+.workbench .button:hover, .workbench .toggle-button:hover, .workbench .toggle-button:selected {
+    -fx-background-color: #e8f0ff;
+}
+
+.workbench .button:focused, .workbench .toggle-button:focused, .workbench .combo-box:focused {
+    -fx-border-color: #214db0;
+}
+
+.workbench .primary {
+    -fx-background-color: #214db0;
+    -fx-border-color: #214db0;
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+}
+
+.workbench .primary:hover {
+    -fx-background-color: #193d90;
+}
+
+.workbench .primary:focused {
+    -fx-border-color: #142b57;
+}
+
+.workbench .table-view, .workbench .list-view, .workbench .evidence-values {
+    -fx-background-color: #f8faff;
+    -fx-border-color: #dbe3ed;
+    -fx-background-insets: 0;
+}
+
+.workbench .evidence-values > .viewport {
+    -fx-background-color: #f8faff;
+}
+
+.workbench .evidence-values > .viewport > .content {
+    -fx-padding: 6px;
+}
+
+.workbench .table-row-cell:filled:selected, .workbench .list-cell:filled:selected {
+    -fx-background-color: #e7efff;
+    -fx-text-fill: #182334;
+}
+
+.workbench .titled-pane > .title {
+    -fx-background-color: #ffffff;
+    -fx-border-color: #dbe3ed;
+    -fx-padding: 9px 12px;
+}

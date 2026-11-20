@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Include>
+  <!-- Keep the JDK 21 upgrade path and block older mapped installers. -->
+  <?ifdef JpAllowDowngrades?>
+    <?undef JpAllowDowngrades?>
+  <?endif?>
+</Include>
