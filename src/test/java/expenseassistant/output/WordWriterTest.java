@@ -10,7 +10,9 @@ import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.poi.xwpf.usermodel.ParagraphAlignment;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -50,7 +52,7 @@ class WordWriterTest {
         var release = snapshot(pages);
         writer.write(release, files, four);
         writer.verify(release, four);
-        assertEquals(4, AttachmentLayout.paginate(pages).size());
+        assertPageNumberFooter(four, 4);
         String probeDir = System.getProperty("expenseassistant.wordProbeOutput");
         Path probe = probeDir == null ? temp.resolve("two.docx")
                 : Path.of(probeDir).resolve("正式写入器-双票版式.docx");
@@ -60,7 +62,7 @@ class WordWriterTest {
         assertEquals(2, paired.size());
         writer.write(snapshot(paired), files, probe);
         writer.verify(snapshot(paired), probe);
-        assertEquals(1, AttachmentLayout.paginate(paired).size());
+        assertPageNumberFooter(probe, 1);
     }
 
     @Test
@@ -78,11 +80,31 @@ class WordWriterTest {
         var release = snapshot(pages);
         writer.write(release, Map.of("a", source, "b", source), output);
         writer.verify(release, output);
+        assertPageNumberFooter(output, 3);
         try (var document = new XWPFDocument(Files.newInputStream(output))) {
             assertEquals(3, document.getTables().size());
             assertEquals("", document.getTables().getFirst().getRow(2).getCell(0).getText());
             assertEquals(1, document.getTables().get(1).getNumberOfRows());
         }
+    }
+
+    @Test
+    void rejectsAnAttachmentWithMissingTotalPageField() throws IOException {
+        Path source = twoPagePdf();
+        Path valid = temp.resolve("numbered.docx");
+        Path damaged = temp.resolve("missing-total.docx");
+        var release = snapshot(List.of(page("a", 1, "凭证", TWO_PER_PAGE)));
+        writer.write(release, Map.of("a", source), valid);
+        try (var input = Files.newInputStream(valid); var document = new XWPFDocument(input);
+             var destination = Files.newOutputStream(damaged)) {
+            var paragraph = document.getHeaderFooterPolicy().getDefaultFooter().getParagraphs().getFirst();
+            assertEquals("NUMPAGES", paragraph.getRuns().get(8).getCTR().getInstrTextArray(0).getStringValue().strip());
+            for (int index = 11; index >= 7; index--) {
+                assertTrue(paragraph.removeRun(index));
+            }
+            document.write(destination);
+        }
+        assertEquals("附件页码域校验失败", assertThrows(IOException.class, () -> writer.verify(release, damaged)).getMessage());
     }
 
     @Test
@@ -135,6 +157,21 @@ class WordWriterTest {
     private static ExportSnapshot snapshot(List<ExportSnapshot.AttachmentPage> pages) {
         return new ExportSnapshot("case", "样本", "/case", CaseType.TRAVEL, 1, TemplateArchive.BUNDLED_SHA256,
                 "1", List.of(), pages, List.of());
+    }
+
+    private static void assertPageNumberFooter(Path output, int expectedPages) throws IOException {
+        try (var input = Files.newInputStream(output); var document = new XWPFDocument(input)) {
+            var footer = document.getHeaderFooterPolicy().getDefaultFooter();
+            assertNotNull(footer);
+            var paragraph = footer.getParagraphs().getFirst();
+            assertEquals(ParagraphAlignment.CENTER, paragraph.getAlignment());
+            var runs = paragraph.getRuns();
+            assertEquals(List.of("PAGE", "NUMPAGES"), runs.stream().flatMap(run -> run.getCTR().getInstrTextList().stream())
+                    .map(instruction -> instruction.getStringValue().strip()).toList());
+            assertEquals("第 1/" + expectedPages + " 页", paragraph.getText());
+            assertEquals(expectedPages, document.getTables().size());
+            assertEquals(expectedPages - 1L, document.getParagraphs().stream().filter(XWPFParagraph::isPageBreak).count());
+        }
     }
 
     private static ExportSnapshot.AttachmentPage page(String id, int number, String caption, ExportSnapshot.Layout layout) {

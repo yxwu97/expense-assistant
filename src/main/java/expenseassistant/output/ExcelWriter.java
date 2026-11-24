@@ -74,6 +74,7 @@ public final class ExcelWriter {
                 writeDetail(snapshot.type(), sheet, layout, styles, row, values, widths);
             }
             writeTotals(sheet, layout, styles, total);
+            writeReimburser(sheet, layout, styles, extra, snapshot.reimburser());
             paginate(book, sheet, layout, total, extra);
             book.getCreationHelper().createFormulaEvaluator().evaluateAll();
             book.setForceFormulaRecalculation(false);
@@ -110,14 +111,7 @@ public final class ExcelWriter {
                         && ("A" + firstHeading + ":" + column(layout.columns() - 1) + lastDetail)
                         .equals(sheet.getCTWorksheet().getAutoFilter().getRef()), "筛选范围不符");
             }
-            var signature = sourceSheet.getRow(layout.signatureRow() - 1);
-            for (var candidate : signature) {
-                if (candidate.getCellType() == CellType.STRING) {
-                    var written = sheet.getRow(layout.signatureRow() + extra - 1).getCell(candidate.getColumnIndex());
-                    require(written != null && written.getCellType() == CellType.STRING
-                            && candidate.getStringCellValue().equals(written.getStringCellValue()), "成品签字区域不符");
-                }
-            }
+            verifySignatures(sourceSheet, sheet, layout, extra, snapshot.reimburser());
             int totalRow = layout.totalRow() + extra;
             var totals = new HashMap<Integer, BigDecimal>();
             for (int row = layout.firstRow(); row < totalRow; row++) {
@@ -438,6 +432,52 @@ public final class ExcelWriter {
                 cell.setCellStyle(styles.forCell(cell, AMOUNT_FORMAT, false));
             }
             cell.setCellFormula(totalFormula(layout, rowNumber, col));
+        }
+    }
+
+    private static void writeReimburser(XSSFSheet sheet, Layout layout, CellStyles styles, int extra, String name) {
+        if (name == null) {
+            return;
+        }
+        int rowNumber = layout.signatureRow() + extra;
+        int col = layout.reimburserNameColumn();
+        var row = sheet.getRow(rowNumber - 1);
+        var label = row.getCell(layout.reimburserLabelColumn());
+        var cell = row.getCell(col);
+        if (cell == null) {
+            cell = row.createCell(col);
+            var rowStyle = row.getRowStyle();
+            cell.setCellStyle(rowStyle == null ? label.getCellStyle() : rowStyle);
+        }
+        String text = layout.sharesReimburserCell() ? label.getStringCellValue() + name : name;
+        cell.setCellStyle(styles.forCell(cell, null, true));
+        float demanded = requiredHeight(cell, text, textWidths(sheet, layout, rowNumber - 1)[col], true);
+        if (demanded > EXCEL_ROW_LIMIT) {
+            throw overflow(sheet, rowNumber, col);
+        }
+        row.setHeightInPoints(Math.max(row.getHeightInPoints(), demanded));
+        cell.setCellValue(text);
+    }
+
+    private static void verifySignatures(XSSFSheet source, XSSFSheet sheet, Layout layout, int extra,
+                                         String name) throws IOException {
+        int rowNumber = layout.signatureRow() + extra;
+        var original = source.getRow(layout.signatureRow() - 1);
+        var written = sheet.getRow(rowNumber - 1);
+        require(written != null, "成品缺少签字行 " + rowNumber);
+        for (var cell : original) {
+            if (cell.getCellType() == CellType.STRING) {
+                int col = cell.getColumnIndex();
+                String expected = cell.getStringCellValue();
+                if (name != null && layout.sharesReimburserCell() && col == layout.reimburserLabelColumn()) {
+                    expected += name;
+                }
+                require(matches(written.getCell(col), expected), "成品签字区域不符 " + column(col) + rowNumber);
+            }
+        }
+        if (!layout.sharesReimburserCell()) {
+            int col = layout.reimburserNameColumn();
+            require(matches(written.getCell(col), name), "成品报销人签字格不符 " + column(col) + rowNumber);
         }
     }
 

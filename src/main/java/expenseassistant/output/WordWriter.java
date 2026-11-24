@@ -4,14 +4,21 @@ import expenseassistant.casework.CaseException;
 import expenseassistant.output.ExportSnapshot.AttachmentPage;
 import expenseassistant.recognition.AttachmentImages;
 import org.apache.poi.common.usermodel.PictureType;
+import org.apache.poi.wp.usermodel.HeaderFooterType;
 import org.apache.poi.xwpf.usermodel.LineSpacingRule;
 import org.apache.poi.xwpf.usermodel.ParagraphAlignment;
 import org.apache.poi.xwpf.usermodel.TableRowAlign;
 import org.apache.poi.xwpf.usermodel.TableRowHeightRule;
 import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFFooter;
 import org.apache.poi.xwpf.usermodel.XWPFParagraph;
 import org.apache.poi.xwpf.usermodel.XWPFRun;
 import org.apache.poi.xwpf.usermodel.XWPFTableCell;
+import org.apache.xmlbeans.QNameSet;
+import org.apache.xmlbeans.impl.xb.xmlschema.SpaceAttribute;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTSectPr;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STFldCharType;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STHdrFtr;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STPageOrientation;
 import org.openxmlformats.schemas.wordprocessingml.x2006.main.STTblLayoutType;
 
@@ -32,6 +39,9 @@ import static expenseassistant.output.AttachmentLayout.emu;
 import static expenseassistant.output.AttachmentLayout.twips;
 
 public final class WordWriter {
+    private static final double FOOTER_FONT_POINTS = 9;
+    private static final double FOOTER_LINE_POINTS = 12;
+
     public void write(ExportSnapshot snapshot, Map<String, Path> cachedByDocId, Path target) throws IOException {
         List<AttachmentLayout.Sheet> sheets = AttachmentLayout.paginate(snapshot.pages());
         if (sheets.isEmpty()) {
@@ -41,6 +51,7 @@ public final class WordWriter {
                 WordWriter::sourceKey, AttachmentLayout::captionLines));
         try (var document = new XWPFDocument()) {
             configurePaper(document);
+            addPageNumberFooter(document, sheets.size());
             for (int index = 0; index < sheets.size(); index++) {
                 if (index != 0) {
                     var pageBreak = document.createParagraph();
@@ -115,17 +126,22 @@ public final class WordWriter {
         var caption = cell.addParagraph();
         compact(caption, SETTINGS.linePoints());
         caption.setAlignment(ParagraphAlignment.CENTER);
-        var run = caption.createRun();
-        for (var range : List.of(XWPFRun.FontCharRange.ascii, XWPFRun.FontCharRange.hAnsi, XWPFRun.FontCharRange.eastAsia)) {
-            run.setFontFamily(SETTINGS.font(), range);
-        }
-        run.setFontSize(SETTINGS.fontPoints());
+        var run = textRun(caption, SETTINGS.fontPoints());
         for (int index = 0; index < lines.size(); index++) {
             if (index != 0) {
                 run.addBreak();
             }
             run.setText(lines.get(index));
         }
+    }
+
+    private static XWPFRun textRun(XWPFParagraph paragraph, double fontPoints) {
+        var run = paragraph.createRun();
+        for (var range : List.of(XWPFRun.FontCharRange.ascii, XWPFRun.FontCharRange.hAnsi, XWPFRun.FontCharRange.eastAsia)) {
+            run.setFontFamily(SETTINGS.font(), range);
+        }
+        run.setFontSize(fontPoints);
+        return run;
     }
 
     private static void configurePaper(XWPFDocument document) {
@@ -141,8 +157,32 @@ public final class WordWriter {
         margins.setBottom(margin);
         margins.setTop(margin);
         margins.setHeader(BigInteger.ZERO);
-        margins.setFooter(BigInteger.ZERO);
+        margins.setFooter(BigInteger.valueOf(twips(SETTINGS.footerDistanceMm())));
         margins.setGutter(BigInteger.ZERO);
+        section.addNewPgNumType().setStart(BigInteger.ONE);
+    }
+
+    private static void addPageNumberFooter(XWPFDocument document, int sheetCount) {
+        var paragraph = document.createFooter(HeaderFooterType.DEFAULT).createParagraph();
+        paragraph.setAlignment(ParagraphAlignment.CENTER);
+        compact(paragraph, FOOTER_LINE_POINTS);
+        textRun(paragraph, FOOTER_FONT_POINTS).setText("第 ");
+        addPageField(paragraph, "PAGE", "1");
+        textRun(paragraph, FOOTER_FONT_POINTS).setText("/");
+        addPageField(paragraph, "NUMPAGES", Integer.toString(sheetCount));
+        textRun(paragraph, FOOTER_FONT_POINTS).setText(" 页");
+    }
+
+    private static void addPageField(XWPFParagraph paragraph, String field, String initialResult) {
+        var begin = textRun(paragraph, FOOTER_FONT_POINTS).getCTR().addNewFldChar();
+        begin.setFldCharType(STFldCharType.BEGIN);
+        begin.setDirty(true);
+        var instruction = textRun(paragraph, FOOTER_FONT_POINTS).getCTR().addNewInstrText();
+        instruction.setSpace(SpaceAttribute.Space.PRESERVE);
+        instruction.setStringValue(" " + field + " ");
+        textRun(paragraph, FOOTER_FONT_POINTS).getCTR().addNewFldChar().setFldCharType(STFldCharType.SEPARATE);
+        textRun(paragraph, FOOTER_FONT_POINTS).setText(initialResult);
+        textRun(paragraph, FOOTER_FONT_POINTS).getCTR().addNewFldChar().setFldCharType(STFldCharType.END);
     }
 
     private static void compact(XWPFParagraph paragraph, double points) {
@@ -164,6 +204,7 @@ public final class WordWriter {
                     || !margin.equals(section.getPgMar().getBottom()) || !margin.equals(section.getPgMar().getTop())) {
                 throw new IOException("附件纸型或页边距校验失败");
             }
+            verifyPageNumberFooter(document, section, sheets.size());
             if (document.getTables().size() != sheets.size()
                     || document.getParagraphs().stream().filter(XWPFParagraph::isPageBreak).count() != sheets.size() - 1L) {
                 throw new IOException("附件纸页或分页符数量校验失败");
@@ -186,6 +227,48 @@ public final class WordWriter {
                 }
             }
         }
+    }
+
+    private static void verifyPageNumberFooter(XWPFDocument document, CTSectPr section, int sheetCount) throws IOException {
+        if (!BigInteger.valueOf(twips(SETTINGS.footerDistanceMm())).equals(section.getPgMar().getFooter())
+                || section.getPgNumType() == null || !BigInteger.ONE.equals(section.getPgNumType().getStart())
+                || section.isSetTitlePg() || section.sizeOfFooterReferenceArray() != 1) {
+            throw new IOException("附件页脚位置或起始页码校验失败");
+        }
+        var reference = section.getFooterReferenceArray(0);
+        if (reference.getType() != STHdrFtr.DEFAULT
+                || !(document.getRelationById(reference.getId()) instanceof XWPFFooter footer)
+                || footer.getBodyElements().size() != 1 || footer.getParagraphs().size() != 1) {
+            throw new IOException("附件默认页脚校验失败");
+        }
+        var paragraph = footer.getParagraphs().getFirst();
+        var runs = paragraph.getRuns();
+        if (paragraph.getAlignment() != ParagraphAlignment.CENTER || paragraph.getSpacingBefore() != 0
+                || paragraph.getSpacingAfter() != 0 || paragraph.getSpacingLineRule() != LineSpacingRule.EXACT
+                || paragraph.getSpacingBetween() != FOOTER_LINE_POINTS || runs.size() != 13
+                || runs.stream().anyMatch(run -> run.getCTR().selectChildren(QNameSet.ALL).length != 2
+                        || !SETTINGS.font().equals(run.getFontFamily(XWPFRun.FontCharRange.eastAsia))
+                        || !Double.valueOf(FOOTER_FONT_POINTS).equals(run.getFontSizeAsDouble()))
+                || !"第 ".equals(runs.get(0).getText(0)) || !"/".equals(runs.get(6).getText(0))
+                || !" 页".equals(runs.getLast().getText(0))
+                || !matchesPageField(runs.subList(1, 6), "PAGE", "1")
+                || !matchesPageField(runs.subList(7, 12), "NUMPAGES", Integer.toString(sheetCount))) {
+            throw new IOException("附件页码域校验失败");
+        }
+    }
+
+    private static boolean matchesPageField(List<XWPFRun> runs, String field, String initialResult) {
+        var instruction = runs.get(1).getCTR().getInstrTextList();
+        return matchesFieldCharacter(runs.get(0), STFldCharType.BEGIN)
+                && instruction.size() == 1 && (" " + field + " ").equals(instruction.getFirst().getStringValue())
+                && matchesFieldCharacter(runs.get(2), STFldCharType.SEPARATE)
+                && initialResult.equals(runs.get(3).getText(0))
+                && matchesFieldCharacter(runs.get(4), STFldCharType.END);
+    }
+
+    private static boolean matchesFieldCharacter(XWPFRun run, STFldCharType.Enum type) {
+        var characters = run.getCTR().getFldCharList();
+        return characters.size() == 1 && characters.getFirst().getFldCharType() == type;
     }
 
     private static void verifyPage(XWPFTableCell cell, AttachmentPage page) throws IOException {

@@ -20,7 +20,8 @@ import expenseassistant.recognition.AttachmentImages.CropMode;
 
 public record ExportSnapshot(String caseId, String caseName, String caseFolder, CaseType type, long revision,
                              String templateHash, String ruleVersion, List<ExpenseRow> rows,
-                             List<AttachmentPage> pages, List<UnavailableSource> unavailable, Audit audit) {
+                             List<AttachmentPage> pages, List<UnavailableSource> unavailable, Audit audit,
+                             String reimburser) {
     public ExportSnapshot {
         rows = List.copyOf(rows);
         pages = List.copyOf(pages);
@@ -34,7 +35,17 @@ public record ExportSnapshot(String caseId, String caseName, String caseFolder, 
         this(caseId, caseName, caseFolder, type, revision, templateHash, ruleVersion, rows, pages, unavailable, Audit.EMPTY);
     }
 
+    public ExportSnapshot(String caseId, String caseName, String caseFolder, CaseType type, long revision,
+                          String templateHash, String ruleVersion, List<ExpenseRow> rows,
+                          List<AttachmentPage> pages, List<UnavailableSource> unavailable, Audit audit) {
+        this(caseId, caseName, caseFolder, type, revision, templateHash, ruleVersion, rows, pages, unavailable, audit, null);
+    }
+
     public static ExportSnapshot fromDraft(CaseView view) {
+        return fromDraft(view, null);
+    }
+
+    public static ExportSnapshot fromDraft(CaseView view, String reimburser) {
         var info = view.info();
         String pending = DraftService.pendingAmountRefreshCode(view);
         if (pending != null) {
@@ -56,7 +67,8 @@ public record ExportSnapshot(String caseId, String caseName, String caseFolder, 
         view.items().stream().filter(item -> item.reviewReasons().contains("UNMAPPED_CONFIRMATION"))
                 .forEach(item -> unavailable.add(new UnavailableSource(item.id(), item.description(), 0, "UNMAPPED_CONFIRMATION")));
         return new ExportSnapshot(info.id(), info.folder().getFileName().toString(), info.folder().toString(), info.type(),
-                info.revision(), info.templateHash(), info.ruleVersion(), rows, view.attachments(), unavailable, audit(view));
+                info.revision(), info.templateHash(), info.ruleVersion(), rows, view.attachments(), unavailable, audit(view),
+                reimburser);
     }
 
     private static Audit audit(CaseView view) {

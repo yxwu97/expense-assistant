@@ -7,6 +7,7 @@ import org.apache.poi.ss.format.CellFormat;
 import org.apache.poi.ss.usermodel.CellType;
 import org.apache.poi.ss.usermodel.DataFormatter;
 import org.apache.poi.ss.usermodel.DateUtil;
+import org.apache.poi.ss.util.CellRangeAddress;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -43,39 +44,149 @@ class ExcelWriterTest {
         var layout = TemplateCatalog.companyLayout(type);
         for (int count : new int[]{layout.capacity(), layout.capacity() + 1}) {
             var entries = IntStream.range(0, count).mapToObj(i -> row(type).withAmount(100L + i)).toList();
+            int extra = count - layout.capacity();
             var snapshot = snapshot(type, entries);
             Path target = scratch.resolve("输出-" + count + ".xlsx");
             writer.write(snapshot, target);
             writer.evaluateAndVerify(snapshot, target);
-            int extra = count - layout.capacity();
-            try (var input = Files.newInputStream(target); var book = new XSSFWorkbook(input)) {
-                var sheet = book.getSheetAt(0);
-                assertEquals(1, book.getNumberOfSheets());
-                assertEquals(layout.sheetName(), sheet.getSheetName());
-                assertEquals(layout.landscape(), sheet.getPrintSetup().getLandscape());
-                assertEquals(9, sheet.getPrintSetup().getPaperSize());
-                assertEquals(layout.firstRow() - 2, sheet.getRepeatingRows().getLastRow());
-                assertEquals(1, sheet.getPrintSetup().getFitWidth());
-                var firstDate = sheet.getRow(layout.firstRow() - 1).getCell(0);
-                assertTrue(DateUtil.isCellDateFormatted(firstDate));
-                assertEquals(type == CaseType.TRAVEL ? "m\"月\"d\"日\"" : "yyyy-mm-dd",
-                        firstDate.getCellStyle().getDataFormatString());
-                var lastColumn = org.apache.poi.ss.util.CellReference.convertNumToColString(layout.columns() - 1);
-                assertTrue(book.getPrintArea(0).endsWith("!$A$1:$" + lastColumn + "$" + (layout.printLastRow() + extra)));
-                var total = sheet.getRow(layout.totalRow() + extra - 1).getCell(layout.totalColumn());
-                assertEquals(IntStream.range(0, count).mapToDouble(i -> (100 + i) / 100.0).sum(),
-                        total.getNumericCellValue(), 0.00001);
-                if (type == CaseType.TAXI) {
-                    int lastDetail = layout.totalRow() + extra - 1;
-                    var ranges = sheet.getMergedRegions().stream().map(org.apache.poi.ss.util.CellRangeAddress::formatAsString).toList();
-                    assertTrue(ranges.contains("F" + lastDetail + ":H" + lastDetail));
-                    assertTrue(ranges.contains("I" + lastDetail + ":J" + lastDetail));
-                    for (int col : new int[]{1, 4, 6, 7, 9}) {
-                        var cell = sheet.getRow(lastDetail - 1).getCell(col);
-                        assertTrue(cell == null || cell.getCellType() == CellType.BLANK);
-                    }
+            assertSignature(target, type, extra, null);
+            var named = snapshot(type, entries, "测试·报销人");
+            Path signed = scratch.resolve("签字-" + count + ".xlsx");
+            writer.write(named, signed);
+            writer.evaluateAndVerify(named, signed);
+            assertSignature(signed, type, extra, named.reimburser());
+            assertTemplateLayout(target, snapshot, layout, extra);
+        }
+    }
+
+    private static void assertTemplateLayout(Path target, ExportSnapshot snapshot, TemplateCatalog.Layout layout,
+                                             int extra) throws IOException {
+        CaseType type = snapshot.type();
+        int count = snapshot.rows().size();
+        try (var input = Files.newInputStream(target); var book = new XSSFWorkbook(input)) {
+            var sheet = book.getSheetAt(0);
+            assertEquals(1, book.getNumberOfSheets());
+            assertEquals(layout.sheetName(), sheet.getSheetName());
+            assertEquals(layout.landscape(), sheet.getPrintSetup().getLandscape());
+            assertEquals(9, sheet.getPrintSetup().getPaperSize());
+            assertEquals(layout.firstRow() - 2, sheet.getRepeatingRows().getLastRow());
+            assertEquals(1, sheet.getPrintSetup().getFitWidth());
+            var firstDate = sheet.getRow(layout.firstRow() - 1).getCell(0);
+            assertTrue(DateUtil.isCellDateFormatted(firstDate));
+            assertEquals(type == CaseType.TRAVEL ? "m\"月\"d\"日\"" : "yyyy-mm-dd",
+                    firstDate.getCellStyle().getDataFormatString());
+            var lastColumn = org.apache.poi.ss.util.CellReference.convertNumToColString(layout.columns() - 1);
+            assertTrue(book.getPrintArea(0).endsWith("!$A$1:$" + lastColumn + "$" + (layout.printLastRow() + extra)));
+            var total = sheet.getRow(layout.totalRow() + extra - 1).getCell(layout.totalColumn());
+            assertEquals(IntStream.range(0, count).mapToDouble(i -> (100 + i) / 100.0).sum(),
+                    total.getNumericCellValue(), 0.00001);
+            if (type == CaseType.TAXI) {
+                int lastDetail = layout.totalRow() + extra - 1;
+                var ranges = sheet.getMergedRegions().stream().map(org.apache.poi.ss.util.CellRangeAddress::formatAsString).toList();
+                assertTrue(ranges.contains("F" + lastDetail + ":H" + lastDetail));
+                assertTrue(ranges.contains("I" + lastDetail + ":J" + lastDetail));
+                for (int col : new int[]{1, 4, 6, 7, 9}) {
+                    var cell = sheet.getRow(lastDetail - 1).getCell(col);
+                    assertTrue(cell == null || cell.getCellType() == CellType.BLANK);
                 }
             }
+        }
+    }
+
+    private static void assertSignature(Path file, CaseType type, int extra, String name) throws IOException {
+        var positions = CellRangeAddress.valueOf(switch (type) {
+            case TRAVEL -> "B13:C13";
+            case ENTERTAINMENT -> "B10";
+            case PRIVATE_CAR -> "B11:C11";
+            case TAXI -> "B14:C14";
+            case OTHER -> "A12:B12";
+        });
+        try (var input = Files.newInputStream(file); var book = new XSSFWorkbook(input)) {
+            var signature = book.getSheetAt(0).getRow(positions.getFirstRow() + extra);
+            var label = signature.getCell(positions.getFirstColumn());
+            assertEquals(CellType.STRING, label.getCellType());
+            String expected = type == CaseType.ENTERTAINMENT && name != null ? "报销人：" + name : "报销人：";
+            assertEquals(expected, label.getStringCellValue());
+            if (type == CaseType.ENTERTAINMENT) {
+                assertEquals("部门领导：", signature.getCell(2).getStringCellValue());
+            } else {
+                var cell = signature.getCell(positions.getLastColumn());
+                if (name == null) {
+                    assertTrue(cell == null || cell.getCellType() == CellType.BLANK);
+                } else {
+                    assertEquals(CellType.STRING, cell.getCellType());
+                    assertEquals(name, cell.getStringCellValue());
+                }
+            }
+        }
+    }
+
+    @Test
+    void wrapsLongReimburserUsingTheSignatureStyle() throws Exception {
+        var snapshot = snapshot(CaseType.ENTERTAINMENT, List.of(), "阿依古丽·阿不都热合曼".repeat(3));
+        Path output = scratch.resolve("长姓名.xlsx");
+        writer.write(snapshot, output);
+        writer.evaluateAndVerify(snapshot, output);
+        assertSignature(output, CaseType.ENTERTAINMENT, 0, snapshot.reimburser());
+        try (var input = Files.newInputStream(output); var book = new XSSFWorkbook(input);
+             var original = Files.newInputStream(archive.locate(TemplateArchive.BUNDLED_SHA256));
+             var originalBook = new XSSFWorkbook(original)) {
+            var signature = book.getSheetAt(0).getRow(9);
+            var originalSignature = originalBook.getSheet(TemplateCatalog.companySheetName(CaseType.ENTERTAINMENT)).getRow(9);
+            var style = signature.getCell(1).getCellStyle();
+            assertTrue(style.getWrapText());
+            assertFalse(style.getShrinkToFit());
+            assertEquals(originalSignature.getCell(1).getCellStyle().getFontIndex(), style.getFontIndex());
+            assertTrue(signature.getHeightInPoints() > originalSignature.getHeightInPoints());
+        }
+    }
+
+    @Test
+    void rejectsChangesToTheReimburserAndOtherSignatures() throws Exception {
+        var snapshot = snapshot(CaseType.TRAVEL, List.of(), "=1+1");
+        Path correct = scratch.resolve("公式外观姓名.xlsx");
+        writer.write(snapshot, correct);
+        writer.evaluateAndVerify(snapshot, correct);
+        assertSignature(correct, CaseType.TRAVEL, 0, snapshot.reimburser());
+
+        Path modifiedName = scratch.resolve("改动姓名.xlsx");
+        alterSignature(correct, modifiedName, 2, "其他姓名");
+        assertTrue(assertThrows(IOException.class, () -> writer.evaluateAndVerify(snapshot, modifiedName))
+                .getMessage().contains("C13"));
+        assertTrue(assertThrows(IOException.class, () -> writer.evaluateAndVerify(snapshot(CaseType.TRAVEL, List.of()), correct))
+                .getMessage().contains("C13"));
+
+        Path modifiedApproval = scratch.resolve("改动审批栏.xlsx");
+        alterSignature(correct, modifiedApproval, 4, "其他签字栏");
+        assertTrue(assertThrows(IOException.class, () -> writer.evaluateAndVerify(snapshot, modifiedApproval))
+                .getMessage().contains("E13"));
+    }
+
+    @Test
+    void rejectsAnOccupiedOrNonAnchorReimburserCellInTheTemplate() throws Exception {
+        var layout = TemplateCatalog.companyLayout(CaseType.TRAVEL);
+        try (var input = Files.newInputStream(archive.locate(TemplateArchive.BUNDLED_SHA256));
+             var book = new XSSFWorkbook(input)) {
+            var sheet = book.getSheet(layout.sheetName());
+            var row = sheet.getRow(12);
+            var occupied = row.createCell(2);
+            occupied.setCellValue("已有说明");
+            var occupiedError = assertThrows(CaseException.class, () -> TemplateCatalog.verifyTemplate(book, layout));
+            assertEquals("TEMPLATE_MISMATCH", occupiedError.code());
+            assertTrue(occupiedError.getMessage().contains("C13"));
+            row.removeCell(occupied);
+            sheet.addMergedRegion(CellRangeAddress.valueOf("B13:C13"));
+            var mergedError = assertThrows(CaseException.class, () -> TemplateCatalog.verifyTemplate(book, layout));
+            assertEquals("TEMPLATE_MISMATCH", mergedError.code());
+            assertTrue(mergedError.getMessage().contains("C13"));
+        }
+    }
+
+    private static void alterSignature(Path source, Path target, int column, String value) throws IOException {
+        try (var input = Files.newInputStream(source); var book = new XSSFWorkbook(input);
+             var output = Files.newOutputStream(target)) {
+            book.getSheetAt(0).getRow(12).getCell(column).setCellValue(value);
+            book.write(output);
         }
     }
 
@@ -284,8 +395,12 @@ class ExcelWriterTest {
     }
 
     private ExportSnapshot snapshot(CaseType type, List<ExpenseRow> rows) {
+        return snapshot(type, rows, null);
+    }
+
+    private ExportSnapshot snapshot(CaseType type, List<ExpenseRow> rows, String name) {
         return new ExportSnapshot("xlsx", "样本", scratch.toString(), type, 1,
-                TemplateArchive.BUNDLED_SHA256, "1", rows, List.of(), List.of());
+                TemplateArchive.BUNDLED_SHA256, "1", rows, List.of(), List.of(), null, name);
     }
 
     private static SampleRow row(CaseType type) {

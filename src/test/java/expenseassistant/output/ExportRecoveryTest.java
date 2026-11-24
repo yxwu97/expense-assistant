@@ -16,6 +16,7 @@ import expenseassistant.output.ExportService.FileKind;
 import expenseassistant.output.ExportService.Record;
 import expenseassistant.output.ExportService.State;
 import expenseassistant.platform.AppPaths;
+import expenseassistant.platform.ReimburserSettings;
 import expenseassistant.recognition.RecognitionService;
 import expenseassistant.store.Database;
 import expenseassistant.store.InstanceLock;
@@ -244,16 +245,7 @@ class ExportRecoveryTest {
                 List.of(new DraftService.SetAmount(itemId, Component.OTHER, "CNY", 12345L, "人工批准金额")));
         var output = fixture.exports().generate(fixture.caseId(), priced.info().revision(), fixture.destination(), "audit");
         assertEquals(State.SUCCEEDED, output.state(), output.message());
-        var database = Database.open(fixture.paths().databaseFile());
-        String json = database.read(connection -> {
-            try (var statement = connection.prepareStatement("SELECT snapshot_json FROM export_record WHERE export_id = ?")) {
-                statement.setString(1, output.exportId());
-                try (var rows = statement.executeQuery()) {
-                    assertTrue(rows.next());
-                    return rows.getString(1);
-                }
-            }
-        });
+        String json = snapshotJson(fixture, output);
         var mapper = new ObjectMapper().registerModule(new JavaTimeModule());
         var snapshot = mapper.readValue(json, ExportSnapshot.class);
         assertEquals(priced.info().revision(), snapshot.revision());
@@ -270,6 +262,107 @@ class ExportRecoveryTest {
         ObjectNode previousFormat = (ObjectNode) mapper.readTree(json);
         previousFormat.remove("audit");
         assertTrue(mapper.treeToValue(previousFormat, ExportSnapshot.class).audit().exclusions().isEmpty());
+    }
+
+    @Test
+    void freezesReimburserAtRequestStartAndReadsSettingsOnlyForNewRequests() throws Exception {
+        var fixture = fixture();
+        var settings = new ReimburserSettings(fixture.paths().dataDirectory());
+        settings.save("测试报销人甲");
+        var exporting = services(fixture.directory(), null, ExportPublisher::atomicMove, (point, record) -> {
+            if (point == Boundary.GENERATING) {
+                settings.save("测试报销人乙");
+            }
+        });
+
+        var first = exporting.exports().generate(fixture.caseId(), fixture.revision(), fixture.destination(), "original-name");
+        assertEquals("测试报销人乙", settings.load());
+        assertFrozenReimburser(fixture, first, "测试报销人甲");
+        assertEquals(first, fixture.generate("original-name"));
+        verifyPair(fixture.services(), first);
+
+        var second = fixture.generate("new-name");
+        assertEquals(first.revision(), second.revision());
+        assertNotEquals(first.exportId(), second.exportId());
+        assertFrozenReimburser(fixture, second, "测试报销人乙");
+
+        settings.save("");
+        assertFrozenReimburser(fixture, fixture.generate("cleared-name"), null);
+        assertEquals(first, fixture.generate("original-name"));
+        verifyPair(fixture.services(), first);
+        verifyPair(fixture.services(), second);
+    }
+
+    @Test
+    void recoversFrozenPairAndReplaysLegacySnapshotWithCorruptSettings() throws Exception {
+        var fixture = fixture();
+        var settings = new ReimburserSettings(fixture.paths().dataDirectory());
+        var legacy = fixture.generate("legacy-no-name");
+        assertFrozenReimburser(fixture, legacy, null);
+        var mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        var previousFormat = (ObjectNode) mapper.readTree(snapshotJson(fixture, legacy));
+        previousFormat.remove("reimburser");
+        assertNull(mapper.treeToValue(previousFormat, ExportSnapshot.class).reimburser());
+        Database.open(fixture.paths().databaseFile()).transaction(connection -> {
+            update(connection, "UPDATE export_record SET snapshot_json=? WHERE export_id=?",
+                    previousFormat.toString(), legacy.exportId());
+            return null;
+        });
+
+        settings.save("待发布测试名");
+        var staged = interruptedAtManifest(fixture);
+        assertEquals(State.READY_TO_PUBLISH, staged.state());
+        Files.writeString(fixture.paths().dataDirectory().resolve("reimburser.txt"), "测试甲\n测试乙");
+
+        var reopened = services(fixture.directory(), null, ExportPublisher::atomicMove, (point, record) -> {});
+        Record recovered;
+        try (var lock = InstanceLock.acquire(reopened.paths().dataDirectory())) {
+            var recoveredExports = reopened.exports().recover();
+            assertEquals(1, recoveredExports.size());
+            recovered = recoveredExports.getFirst();
+        }
+        assertEquals(staged.exportId(), recovered.exportId());
+        assertEquals(staged.files(), recovered.files());
+        assertFrozenReimburser(fixture, recovered, "待发布测试名");
+        assertEquals(legacy, reopened.exports().generate(fixture.caseId(), fixture.revision(),
+                fixture.destination(), "legacy-no-name"));
+        assertEquals("STALE_REVISION", assertThrows(CaseException.class, () -> reopened.exports().generate(
+                fixture.caseId(), fixture.revision() - 1, fixture.destination(), "stale-new-request")).code());
+        var rejected = assertThrows(CaseException.class, () -> reopened.exports().generate(
+                fixture.caseId(), fixture.revision(), fixture.destination(), "corrupt-settings"));
+        assertEquals("REIMBURSER_SETTINGS_INVALID", rejected.code());
+        assertEquals(List.of(recovered, legacy), reopened.exports().history(fixture.caseId()));
+        assertEquals(recovered.exportId(), reopened.cases().load(fixture.caseId()).currentExportId());
+        verifyPair(reopened, recovered);
+        verifyPair(reopened, legacy);
+    }
+
+    private static void assertFrozenReimburser(Fixture fixture, Record record, String name) throws IOException {
+        assertEquals(State.SUCCEEDED, record.state(), record.message());
+        var mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+        var snapshot = mapper.readValue(snapshotJson(fixture, record), ExportSnapshot.class);
+        assertEquals(name, snapshot.reimburser());
+        try (var input = Files.newInputStream(record.file(FileKind.XLSX).path());
+             var workbook = new XSSFWorkbook(input)) {
+            var cell = workbook.getSheetAt(0).getRow(11).getCell(1, Row.MissingCellPolicy.RETURN_BLANK_AS_NULL);
+            if (name == null) {
+                assertNull(cell);
+            } else {
+                assertEquals(name, cell.getStringCellValue());
+            }
+        }
+    }
+
+    private static String snapshotJson(Fixture fixture, Record record) {
+        return Database.open(fixture.paths().databaseFile()).read(connection -> {
+            try (var statement = connection.prepareStatement("SELECT snapshot_json FROM export_record WHERE export_id = ?")) {
+                statement.setString(1, record.exportId());
+                try (var rows = statement.executeQuery()) {
+                    assertTrue(rows.next());
+                    return rows.getString(1);
+                }
+            }
+        });
     }
 
     @Test

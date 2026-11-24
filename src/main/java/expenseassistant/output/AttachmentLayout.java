@@ -135,7 +135,7 @@ public final class AttachmentLayout {
     }
 
     record Settings(double widthMm, double heightMm, double marginMm, double slotMm, double gapMm,
-                    double footerReserveMm, double imageWidthMm, double imageHeightMm, float imageDpi,
+                    double footerReserveMm, double footerDistanceMm, double imageWidthMm, double imageHeightMm, float imageDpi,
                     String font, double fontPoints, double linePoints, int maxLines, int maxCharacters) {
         private static Settings load() {
             try (var resource = AttachmentLayout.class.getResourceAsStream("/output/word-layout.properties")) {
@@ -147,6 +147,7 @@ public final class AttachmentLayout {
                 return new Settings(number(properties, "page.width.mm"), number(properties, "page.height.mm"),
                         number(properties, "page.margin.mm"), number(properties, "slot.height.mm"),
                         number(properties, "slot.gap.mm"), number(properties, "page.footer.reserve.mm"),
+                        number(properties, "page.footer.distance.mm"),
                         number(properties, "image.max.width.mm"), number(properties, "image.max.height.mm"),
                         (float) number(properties, "image.dpi"), properties.getProperty("caption.font"),
                         number(properties, "caption.size.pt"), number(properties, "caption.line.spacing.pt"),

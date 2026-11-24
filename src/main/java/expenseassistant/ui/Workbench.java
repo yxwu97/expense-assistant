@@ -22,6 +22,7 @@ import expenseassistant.output.ExportSnapshot.UnavailableSource;
 import expenseassistant.output.TemplateArchive;
 import expenseassistant.output.TemplateCatalog;
 import expenseassistant.platform.AppVersion;
+import expenseassistant.platform.ReimburserSettings;
 import expenseassistant.platform.WpsLauncher;
 import expenseassistant.recognition.AttachmentImages;
 import expenseassistant.recognition.AttachmentImages.CropMode;
@@ -49,6 +50,8 @@ import javafx.scene.control.SplitPane;
 import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableView;
 import javafx.scene.control.TextArea;
+import javafx.scene.control.TextField;
+import javafx.scene.control.TextFormatter;
 import javafx.scene.control.TextInputDialog;
 import javafx.scene.control.TitledPane;
 import javafx.scene.control.ToggleButton;
@@ -93,6 +96,7 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
     private final ExportService exports;
     private final TemplateArchive archive;
     private final TemplateCatalog templates;
+    private final ReimburserSettings reimburser;
     private final EvidenceEditor editor = new EvidenceEditor();
     private final ExecutorService operations = Executors.newSingleThreadExecutor(Thread.ofVirtual().name("expense-workbench").factory());
     private final ExecutorService previews = Executors.newSingleThreadExecutor(Thread.ofVirtual().name("expense-preview").factory());
@@ -101,6 +105,7 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
     private final VBox content = new VBox(14);
     private final SplitPane review = new SplitPane();
     private final Label appVersion = label("expense-app-version", AppVersion.displayText());
+    private final Button reimburserSettings = button("expense-reimburser-settings", "报销人设置");
     private final Label folderName = label("expense-case-path", "请选择报销目录");
     private final Label notice = label("expense-notice", "");
     private final Label progressText = label("expense-progress-text", "选择存放凭证的目录后自动扫描。");
@@ -172,6 +177,7 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
     private record ScanOutcome(CaseView view, boolean cancelled, RuntimeException failure) {}
     private record PendingEdit(String caseId, EvidenceEditor.Edit edit) {}
     private record SaveOutcome(CaseView view, EvidenceEditor.Edit conflict) {}
+    private record ReimburserValue(String name, String issue) {}
     private record PrintPlacement(AttachmentPage page, String position) {}
     private record OutputState(List<Record> history, Path preferredRoot, Record current,
                                String excelIssue, String wordIssue, String templateIssue) {
@@ -194,7 +200,8 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
     }
 
     public Workbench(CaseService cases, ScanService scans, DraftService drafts, WpsLauncher wps,
-                     ExportService exports, TemplateArchive archive, TemplateCatalog templates) {
+                     ExportService exports, TemplateArchive archive, TemplateCatalog templates,
+                     ReimburserSettings reimburser) {
         this.cases = cases;
         this.scans = scans;
         this.drafts = drafts;
@@ -202,6 +209,7 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
         this.exports = exports;
         this.archive = archive;
         this.templates = templates;
+        this.reimburser = reimburser;
         setId("expense-workbench");
         getStyleClass().add("workbench");
         var stylesheet = Workbench.class.getResource("/ui/workbench.css");
@@ -223,7 +231,74 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
         var title = label("expense-title", "报销助手");
         title.getStyleClass().add("app-title");
         appVersion.getStyleClass().add("quiet");
-        return row(mark, title, spacer(), appVersion);
+        reimburserSettings.setOnAction(event -> run("正在读取报销人设置…", this::readReimburser, this::editReimburser));
+        return row(mark, title, spacer(), reimburserSettings, appVersion);
+    }
+
+    private ReimburserValue readReimburser() {
+        try {
+            return new ReimburserValue(Objects.toString(reimburser.load(), ""), "");
+        } catch (ReimburserSettings.SettingsException invalid) {
+            if (!ReimburserSettings.INVALID_CONTENT.equals(invalid.code())) throw invalid;
+            return new ReimburserValue("", invalid.getMessage());
+        }
+    }
+
+    private void editReimburser(ReimburserValue current) {
+        progressText.setText("已读取报销人设置");
+        var dialog = new Dialog<String>();
+        if (owner() != null) dialog.initOwner(owner());
+        dialog.setTitle("报销人设置");
+        var name = new TextField(current.name());
+        name.setId("expense-reimburser-name");
+        name.setAccessibleText("默认报销人");
+        name.setPromptText("输入默认报销人姓名");
+        HBox.setHgrow(name, Priority.ALWAYS);
+        var clear = button("expense-reimburser-clear", "清空");
+        var help = new Label("保存后用于新生成的 Excel 报销清单。留空保存可清除默认报销人。");
+        help.setWrapText(true);
+        var issue = new Label(current.issue());
+        issue.setWrapText(true);
+        hideEmpty(issue);
+        var validation = new Label();
+        validation.setId("expense-reimburser-validation");
+        validation.setWrapText(true);
+        validation.setMinHeight(18);
+        var pane = dialog.getDialogPane();
+        pane.setContent(new VBox(10, help, row(name, clear), issue, validation));
+        pane.setPrefWidth(420);
+        var save = new ButtonType("保存", ButtonBar.ButtonData.OK_DONE);
+        pane.getButtonTypes().setAll(ButtonType.CANCEL, save);
+        var saveButton = pane.lookupButton(save);
+        saveButton.setId("expense-reimburser-save");
+        pane.lookupButton(ButtonType.CANCEL).setId("expense-reimburser-cancel");
+        name.setTextFormatter(new TextFormatter<>(change -> {
+            if (!change.isContentChange()) return change;
+            try {
+                ReimburserSettings.normalize(change.getControlNewText());
+                validation.setText("");
+                saveButton.setDisable(false);
+                return change;
+            } catch (IllegalArgumentException invalid) {
+                validation.setText(invalid.getMessage());
+                saveButton.setDisable(true);
+                return null;
+            }
+        }));
+        clear.setOnAction(event -> {
+            name.clear();
+            validation.setText("");
+            saveButton.setDisable(false);
+        });
+        dialog.setResultConverter(result -> result == save ? name.getText() : null);
+        dialog.showAndWait().ifPresent(this::saveReimburser);
+    }
+
+    private void saveReimburser(String name) {
+        run("正在保存报销人设置…", () -> {
+            reimburser.save(name);
+            return null;
+        }, ignored -> progressText.setText("已保存报销人设置"));
     }
 
     private Node importPane() {
@@ -1189,6 +1264,7 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
         boolean hasUnit = available && relation.unit() != null;
         boolean duplicate = hasUnit && view != null && view.duplicateUnitIds().contains(relation.unit().unitId());
         choose.setDisable(busy);
+        reimburserSettings.setDisable(busy);
         rescan.setDisable(!canEdit);
         show(cancel, busy && active.scan);
         cancel.setDisable(!busy || !active.scan || active.cancelled);
@@ -1251,6 +1327,7 @@ public final class Workbench extends ScrollPane implements AutoCloseable {
             case CaseException domain -> domain.code() + " · " + domain.getMessage();
             case StoreException store -> store.code() + " · " + store.getMessage();
             case TemplateArchive.TemplateMismatch template -> template.code() + " · " + template.getMessage();
+            case ReimburserSettings.SettingsException settings -> settings.code() + " · " + settings.getMessage();
             default -> "当前操作无法完成，请重新选择目录或重试。";
         });
     }

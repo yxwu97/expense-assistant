@@ -9,6 +9,7 @@ import expenseassistant.casework.CaseService;
 import expenseassistant.draft.DraftService;
 import expenseassistant.intake.PathPolicy;
 import expenseassistant.platform.AppPaths;
+import expenseassistant.platform.ReimburserSettings;
 import expenseassistant.recognition.OcrWorkspace;
 import expenseassistant.store.Database;
 
@@ -37,6 +38,7 @@ public final class ExportService {
     private final PathPolicy paths;
     private final TemplateCatalog templates;
     private final AppPaths appPaths;
+    private final ReimburserSettings settings;
     private final ExportPublisher publisher;
     private final Checkpoint checkpoint;
 
@@ -65,16 +67,27 @@ public final class ExportService {
     private record Attempt(Record record, Path staging, String fingerprint) {}
 
     public ExportService(Database database, CaseJobs jobs, PathPolicy paths, TemplateCatalog templates, AppPaths appPaths) {
-        this(database, jobs, paths, templates, appPaths, ExportPublisher::atomicMove, (boundary, record) -> {});
+        this(database, jobs, paths, templates, appPaths, new ReimburserSettings(appPaths.dataDirectory()));
+    }
+
+    public ExportService(Database database, CaseJobs jobs, PathPolicy paths, TemplateCatalog templates, AppPaths appPaths,
+                         ReimburserSettings settings) {
+        this(database, jobs, paths, templates, appPaths, settings, ExportPublisher::atomicMove, (boundary, record) -> {});
     }
 
     ExportService(Database database, CaseJobs jobs, PathPolicy paths, TemplateCatalog templates, AppPaths appPaths,
                   ExportPublisher.Move move, Checkpoint checkpoint) {
+        this(database, jobs, paths, templates, appPaths, new ReimburserSettings(appPaths.dataDirectory()), move, checkpoint);
+    }
+
+    private ExportService(Database database, CaseJobs jobs, PathPolicy paths, TemplateCatalog templates, AppPaths appPaths,
+                          ReimburserSettings settings, ExportPublisher.Move move, Checkpoint checkpoint) {
         this.database = database;
         this.jobs = jobs;
         this.paths = paths;
         this.templates = templates;
         this.appPaths = appPaths;
+        this.settings = settings;
         this.publisher = new ExportPublisher(paths, appPaths.cacheDirectory(), templates, move);
         this.checkpoint = checkpoint;
     }
@@ -113,7 +126,7 @@ public final class ExportService {
                 verifyRetry(connection, caseId, retryOf);
                 return DraftService.read(connection, current);
             });
-            var snapshot = ExportSnapshot.fromDraft(view);
+            var snapshot = ExportSnapshot.fromDraft(view, loadReimburser());
             preflight(snapshot);
             Path requested = outputRoot != null ? outputRoot : preferredRoot(caseId);
             Path root = paths.validateOutputRoot(view.info().batchRoot(), view.info().folder(), requested).path();
@@ -205,6 +218,14 @@ public final class ExportService {
     private Record recover(Attempt attempt) {
         return finalize(attempt, publisher.recover(attempt.record(), attempt.staging()),
                 safeNameFromDirectory(attempt.record()));
+    }
+
+    private String loadReimburser() {
+        try {
+            return settings.load();
+        } catch (ReimburserSettings.SettingsException failure) {
+            throw new CaseException(failure.code(), failure.getMessage(), failure);
+        }
     }
 
     private void preflight(ExportSnapshot snapshot) {

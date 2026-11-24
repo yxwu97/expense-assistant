@@ -9,6 +9,7 @@ import expenseassistant.output.ExportService;
 import expenseassistant.output.TemplateArchive;
 import expenseassistant.output.TemplateCatalog;
 import expenseassistant.platform.AppPaths;
+import expenseassistant.platform.ReimburserSettings;
 import expenseassistant.platform.WpsLauncher;
 import expenseassistant.recognition.RecognitionService;
 import expenseassistant.store.Database;
@@ -100,14 +101,16 @@ public final class ExpenseAssistantApp extends Application {
                 var scans = new ScanService(cases, policy, jobs);
                 var drafts = new DraftService(database, jobs, RecognitionService.fromPaths(paths));
                 var catalog = new TemplateCatalog(templates);
-                var exports = new ExportService(database, jobs, policy, catalog, paths);
+                var reimburser = new ReimburserSettings(paths.dataDirectory());
+                var exports = new ExportService(database, jobs, policy, catalog, paths, reimburser);
                 exports.recover();
                 if (adopt(candidate)) {
                     candidate = null;
                     Platform.runLater(() -> {
                         if (stopped) return;
                         var screen = currentScreen(stage);
-                        workbench = new Workbench(cases, scans, drafts, new WpsLauncher(), exports, templates, catalog);
+                        workbench = new Workbench(cases, scans, drafts, new WpsLauncher(), exports, templates,
+                                catalog, reimburser);
                         stage.setScene(new Scene(workbench));
                         placeStartupWindow(stage, screen, 1090, 760, 520, 420);
                         stage.setOnCloseRequest(event -> {

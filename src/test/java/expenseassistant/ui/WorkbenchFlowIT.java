@@ -15,6 +15,7 @@ import expenseassistant.output.TemplateArchive;
 import expenseassistant.output.TemplateCatalog;
 import expenseassistant.platform.AppPaths;
 import expenseassistant.platform.AppVersion;
+import expenseassistant.platform.ReimburserSettings;
 import expenseassistant.platform.WpsLauncher;
 import expenseassistant.recognition.AttachmentImages;
 import expenseassistant.recognition.AttachmentImages.CropMode;
@@ -25,6 +26,7 @@ import expenseassistant.store.Database;
 import expenseassistant.support.FxTestSession;
 import expenseassistant.support.ReceiptFixtures;
 import expenseassistant.support.SampleCorpus;
+import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.ComboBox;
@@ -32,9 +34,14 @@ import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
 import javafx.scene.control.SplitPane;
 import javafx.scene.control.TableView;
+import javafx.scene.control.TextField;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
+import javafx.stage.Window;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.xwpf.model.XWPFHeaderFooterPolicy;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -42,12 +49,67 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class WorkbenchFlowIT {
     @TempDir Path temporary;
+
+    @Test
+    void editsDefaultReimburserWithoutOpeningACaseAndRestoresItOnRestart() throws Exception {
+        var first = services();
+        try (var fixture = show(first)) {
+            var workbench = fixture.workbench;
+            openReimburserSettings(workbench);
+            FxTestSession.runOnFxThread(() -> {
+                assertEquals("请选择报销目录", label(workbench, "expense-case-path").getText());
+                assertEquals("", reimburserField().getText());
+                reimburserField().replaceText(0, 0, "测试\n甲");
+                assertTrue(settingsButton("expense-reimburser-save").isDisabled());
+                assertTrue(settingsControl("expense-reimburser-validation", Label.class).getText().contains("一行"));
+            });
+            saveReimburser(workbench, "  测试甲  ");
+            openReimburserSettings(workbench);
+            cancelReimburserEdit("测试甲", "取消的名字");
+            assertEquals("测试甲", first.reimburser.load());
+        }
+
+        var restarted = services();
+        try (var fixture = show(restarted)) {
+            var workbench = fixture.workbench;
+            openReimburserSettings(workbench);
+            FxTestSession.runOnFxThread(() -> {
+                assertEquals("测试甲", reimburserField().getText());
+                settingsButton("expense-reimburser-clear").fire();
+                assertEquals("", reimburserField().getText());
+                settingsButton("expense-reimburser-save").fire();
+            });
+            awaitSavedReimburser(workbench);
+        }
+
+        try (var fixture = show(services())) {
+            openReimburserSettings(fixture.workbench);
+            cancelReimburserEdit("", "另一个取消的名字");
+        }
+        assertNull(services().reimburser.load());
+    }
+
+    @Test
+    void opensSettingsForManualRepairAfterReadingDamagedContent() throws Exception {
+        var service = services();
+        Path invalid = temporary.resolve("app data/reimburser.txt");
+        Files.writeString(invalid, "损坏\n内容");
+        try (var fixture = show(service)) {
+            openReimburserSettings(fixture.workbench);
+            cancelReimburserEdit("", "取消的名字");
+            assertEquals("损坏\n内容", Files.readString(invalid));
+            openReimburserSettings(fixture.workbench);
+            saveReimburser(fixture.workbench, "恢复的姓名");
+        }
+        assertEquals("恢复的姓名", service.reimburser.load());
+    }
 
     @Test
     void scansHungzhouPublishesCurrentVersionAndDisablesOldOutputsAfterEdit() throws Exception {
@@ -67,6 +129,8 @@ class WorkbenchFlowIT {
             });
             await(() -> !button(workbench, "expense-generate").isDisabled());
             var info = service.cases.openCase(batch, folder);
+            openReimburserSettings(workbench);
+            saveReimburser(workbench, "测试报销人甲");
             FxTestSession.runOnFxThread(() -> {
                 assertEquals("¥158.79", label(workbench, "expense-total").getText());
                 assertAppVersion(workbench);
@@ -76,7 +140,9 @@ class WorkbenchFlowIT {
                 assertTrue(button(workbench, "expense-choose").isDisabled());
             });
             await(() -> !button(workbench, "expense-open-excel").isDisabled());
-            var published = service.exports.history(info.id()).getFirst();
+            var firstExport = service.exports.history(info.id()).getFirst();
+            assertPairedOutput(service, firstExport, "测试报销人甲");
+            var published = regenerateWithReimburser(service, workbench, firstExport);
             assertEquals(ExportService.State.SUCCEEDED, published.state());
             FxTestSession.runOnFxThread(() -> {
                 assertFalse(button(workbench, "expense-open-word").isDisabled());
@@ -108,6 +174,52 @@ class WorkbenchFlowIT {
             });
             assertEquals(info.revision() + 1, service.drafts.load(info.id()).info().revision());
             assertTrue(Files.isRegularFile(service.exports.verifiedFile(published.exportId(), ExportService.FileKind.XLSX)));
+            assertReimburserInAnotherCase(workbench, Files.createDirectory(batch.resolve("另一个报销目录")));
+        }
+    }
+
+    private static ExportService.Record regenerateWithReimburser(Services service, Workbench workbench,
+                                                                ExportService.Record old) throws Exception {
+        openReimburserSettings(workbench);
+        FxTestSession.runOnFxThread(() -> assertEquals("测试报销人甲", reimburserField().getText()));
+        saveReimburser(workbench, "测试报销人乙");
+        assertEquals(old.revision(), service.drafts.load(old.caseId()).info().revision());
+        assertEquals(old, service.exports.history(old.caseId()).getFirst());
+        assertPairedOutput(service, old, "测试报销人甲");
+
+        FxTestSession.runOnFxThread(() -> button(workbench, "expense-generate").fire());
+        await(() -> !button(workbench, "expense-open-excel").isDisabled());
+        var updated = service.exports.history(old.caseId()).getFirst();
+        assertNotEquals(old.exportId(), updated.exportId());
+        assertEquals(old.revision(), updated.revision());
+        assertPairedOutput(service, updated, "测试报销人乙");
+        assertPairedOutput(service, old, "测试报销人甲");
+        return updated;
+    }
+
+    private static void assertReimburserInAnotherCase(Workbench workbench, Path folder) throws Exception {
+        FxTestSession.runOnFxThread(() -> workbench.selectCase(folder));
+        await(() -> !workbench.busy() && folder.getFileName().toString()
+                .equals(label(workbench, "expense-case-path").getText()));
+        openReimburserSettings(workbench);
+        cancelReimburserEdit("测试报销人乙", "取消的名字");
+    }
+
+    private static void assertPairedOutput(Services service, ExportService.Record record, String expectedName)
+            throws Exception {
+        Path excel = service.exports.verifiedFile(record.exportId(), ExportService.FileKind.XLSX);
+        Path word = service.exports.verifiedFile(record.exportId(), ExportService.FileKind.DOCX);
+        assertEquals(record.file(ExportService.FileKind.XLSX).path(), excel);
+        assertEquals(record.file(ExportService.FileKind.DOCX).path(), word);
+        try (var excelInput = Files.newInputStream(excel); var book = new XSSFWorkbook(excelInput);
+             var wordInput = Files.newInputStream(word); var document = new XWPFDocument(wordInput)) {
+            assertEquals(expectedName, book.getSheetAt(0).getRow(12).getCell(2).getStringCellValue());
+            var footer = new XWPFHeaderFooterPolicy(document).getDefaultFooter();
+            assertNotNull(footer);
+            var instructions = footer.getParagraphs().getFirst().getRuns().stream()
+                    .flatMap(run -> run.getCTR().getInstrTextList().stream())
+                    .map(field -> field.getStringValue().strip()).toList();
+            assertEquals(List.of("PAGE", "NUMPAGES"), instructions);
         }
     }
 
@@ -336,15 +448,16 @@ class WorkbenchFlowIT {
         var archive = new TemplateArchive(data);
         archive.installBundled();
         var templates = new TemplateCatalog(archive);
-        var exports = new ExportService(database, jobs, policy, templates, app);
-        return new Services(database, cases, scan, drafts, archive, templates, exports);
+        var reimburser = new ReimburserSettings(data);
+        var exports = new ExportService(database, jobs, policy, templates, app, reimburser);
+        return new Services(database, cases, scan, drafts, archive, templates, exports, reimburser);
     }
 
     private static Ui show(Services service) throws Exception {
         return FxTestSession.runOnFxThread(() -> {
             var stage = new Stage();
             var workbench = new Workbench(service.cases, service.scan, service.drafts,
-                    new WpsLauncher(), service.exports, service.archive, service.templates);
+                    new WpsLauncher(), service.exports, service.archive, service.templates, service.reimburser);
             stage.setScene(new Scene(workbench, 1050, 740));
             stage.show();
             return new Ui(stage, workbench);
@@ -363,13 +476,59 @@ class WorkbenchFlowIT {
     private static Button button(Workbench workbench, String id) { return (Button) workbench.lookup("#" + id); }
     private static Label label(Workbench workbench, String id) { return (Label) workbench.lookup("#" + id); }
 
+    private static void openReimburserSettings(Workbench workbench) throws Exception {
+        FxTestSession.runOnFxThread(() -> {
+            var settings = button(workbench, "expense-reimburser-settings");
+            assertFalse(settings.isDisabled());
+            settings.fire();
+            assertTrue(settings.isDisabled());
+        });
+        await(() -> reimburserField() != null);
+    }
+
+    private static void saveReimburser(Workbench workbench, String name) throws Exception {
+        FxTestSession.runOnFxThread(() -> {
+            reimburserField().setText(name);
+            assertFalse(settingsButton("expense-reimburser-save").isDisabled());
+            settingsButton("expense-reimburser-save").fire();
+        });
+        awaitSavedReimburser(workbench);
+    }
+
+    private static void awaitSavedReimburser(Workbench workbench) throws Exception {
+        await(() -> reimburserField() == null && !workbench.busy()
+                && "已保存报销人设置".equals(label(workbench, "expense-progress-text").getText()));
+    }
+
+    private static void cancelReimburserEdit(String expected, String newText) throws Exception {
+        FxTestSession.runOnFxThread(() -> {
+            assertEquals(expected, reimburserField().getText());
+            reimburserField().setText(newText);
+            settingsButton("expense-reimburser-cancel").fire();
+        });
+        await(() -> reimburserField() == null);
+    }
+
+    private static TextField reimburserField() {
+        return settingsControl("expense-reimburser-name", TextField.class);
+    }
+
+    private static Button settingsButton(String id) { return settingsControl(id, Button.class); }
+
+    private static <T extends Node> T settingsControl(String id, Class<T> type) {
+        return Window.getWindows().stream().map(Window::getScene).filter(Objects::nonNull)
+                .map(scene -> scene.lookup("#" + id))
+                .filter(Objects::nonNull).map(type::cast).findFirst().orElse(null);
+    }
+
     private static void assertAppVersion(Workbench workbench) {
         assertEquals("版本 " + AppVersion.value().orElseThrow(), label(workbench, "expense-app-version").getText());
         assertNull(workbench.lookup("#expense-revision"));
     }
 
     private record Services(Database database, CaseService cases, ScanService scan, DraftService drafts,
-                            TemplateArchive archive, TemplateCatalog templates, ExportService exports) {}
+                            TemplateArchive archive, TemplateCatalog templates, ExportService exports,
+                            ReimburserSettings reimburser) {}
 
     private record Ui(Stage stage, Workbench workbench) implements AutoCloseable {
         @Override public void close() throws Exception {
